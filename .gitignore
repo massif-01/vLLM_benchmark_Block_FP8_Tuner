@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *$py.class
 *.so
@@ -9,9 +10,8 @@ venv/
 ENV/
 .venv
 
-# Tuned configs
+# Generated output (JSON fixtures/manifests remain trackable)
 tuned_configs/
-*.json
 
 # IDE
 .vscode/

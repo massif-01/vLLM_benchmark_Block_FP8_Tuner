@@ -1,0 +1,96 @@
+# 本轮修复与验证记录
+
+核验日期：2026-10-08（Asia/Shanghai）。仓库起点 HEAD：`03af15286e5e2c643f8bbcd61bc64bbc43dfbd90`；开始时工作区干净。本地修复验收时，修改保留在工作区，尚未 commit/push。随后用户授权将这些改动通过独立分支 PR 提交到自己的仓库供进一步审查；不直接提交到默认分支、不合并 PR。未修改任何 vLLM checkout，未创建 vLLM upstream issue/PR。
+
+本轮以用户 Goal 为最高优先级。实施说明和审查报告仅作为参考/证据：CUDA-only 是产品边界；只维护 W8A8 Block FP8 主路径；INT8/AWQ 不做功能开发。
+
+## 独立核对来源
+
+GitHub API 查询当前 vLLM main 后，固定以下 commit 下载并检查相关源码：`c741bfca70cfb777e2016f827eae31f6e215fe9f`。没有用旧报告的 vLLM SHA 替代本次核验。
+
+- [FP8 kernel、loader、默认配置、block shape 校验](https://github.com/vllm-project/vllm/blob/c741bfca70cfb777e2016f827eae31f6e215fe9f/vllm/model_executor/layers/quantization/utils/fp8_utils.py)：确认 launch 参数/stride、每个 K tile 单 scale group、文件名、closest-M 选择、缓存和默认配置。
+- [设备名 helper](https://github.com/vllm-project/vllm/blob/c741bfca70cfb777e2016f827eae31f6e215fe9f/vllm/utils/platform_utils.py)：统一空白/斜杠；正式代码直接调用已安装版本，不自行替代。
+- [Qwen3](https://github.com/vllm-project/vllm/blob/c741bfca70cfb777e2016f827eae31f6e215fe9f/vllm/model_executor/models/qwen3.py)、[Qwen2 普通 MLP](https://github.com/vllm-project/vllm/blob/c741bfca70cfb777e2016f827eae31f6e215fe9f/vllm/model_executor/models/qwen2.py)、[TP linear](https://github.com/vllm-project/vllm/blob/c741bfca70cfb777e2016f827eae31f6e215fe9f/vllm/model_executor/layers/linear.py)：核对 GQA/KV 复制、非 hidden-size 等式的 head_dim、融合 gate/up 和 row-parallel down。
+- [Qwen3 MoE](https://github.com/vllm-project/vllm/blob/c741bfca70cfb777e2016f827eae31f6e215fe9f/vllm/model_executor/models/qwen3_moe.py)：依据 `mlp_only_layers`、`decoder_sparse_step`、`num_experts` 确认 dense 层是否存在；shared MLP 仅在 sparse 层且 shared size >0 时存在；routed experts 进入 FusedMoEFactory，未纳入 tuner。
+- [FP8 量化配置](https://github.com/vllm-project/vllm/blob/c741bfca70cfb777e2016f827eae31f6e215fe9f/vllm/model_executor/layers/quantization/fp8.py)、[Triton regular-linear backend](https://github.com/vllm-project/vllm/blob/c741bfca70cfb777e2016f827eae31f6e215fe9f/vllm/model_executor/kernels/linear/scaled_mm/triton.py)、[block-linear 基类](https://github.com/vllm-project/vllm/blob/c741bfca70cfb777e2016f827eae31f6e215fe9f/vllm/model_executor/kernels/linear/scaled_mm/BlockScaledMMLinearKernel.py)：配置和实际后端选择是不同的条件；自动 shape 不证明 serving 采用 Triton。
+
+`tests/fixtures/vllm_fp8_contract.py` 只包含固定来源的 helper/loader/default/signature 契约摘录，供 CPU 测试。不是部署内核，不是导入 fallback，也不是实际已安装 vLLM 集成验证。
+
+## 问题映射及处理边界
+
+| 审查线索 | 本轮结果 / 依据 |
+| --- | --- |
+| B01 attention shape | 修复：Q、KV、head_dim、TP 合法性，TP>KV 的精确复制；QKV 和 o_proj 分别推导；TP1/2/4/8 回归 |
+| B02 config 字段不等于真实层 | 修复：仅两个明确 architecture adapter；MoE layer schedule 决定普通 dense/shared MLP；不读取 `moe_intermediate_size` 生成 routed shapes；未知/嵌套架构拒绝 |
+| B03 专用入口身份 | qwencoder FP8 改为主入口薄 wrapper；另两个误名文件实际 INT8，醒目标记历史/非维护，不改量化身份、不 redirect 成 FP8 |
+| B04 INT8 兼容性 | 不开发：用户排除正式维护范围，标记非维护，撤出主文档推荐 |
+| B05/B06 AWQ 消费/搜索问题 | 不开发：标记非维护，历史文档删除“复制 JSON 即自动消费”承诺；未恢复 AWQ 能力 |
+| B07 多 GPU 文件覆盖 | 主脚本 worker 返回、主进程统一写文件本来正确，保留；严格校验每个 worker 的 shape/M 集，防 missing/duplicate/unexpected，保留同型号 GPU 约束 |
+| B08 跨运行/中断保存 | 修复：默认合并 disjoint M、拒绝 overlap；显式 overwrite 仅替换请求 M；读取坏文件拒绝；文件锁+同目录 temp/fsync/replace；并发/故障注入测试 |
+| B09 十倍计时与正确性 | 修复：真实 calls/event 与微秒换算；五次 warmup、多轮中位数、成功候选前三名+可运行 default 独立复测；资源不足 default 不重试，报告记录 unavailable/原因；同量化 tensor/scales 的 FP32 reference；有限值和 tolerance gate；GPU 尚未执行 |
+| B10 fallback/退出码 | 修复：无默认架构、无 catch 后 DeepSeek fallback；wrapper 非零传播；batch runner 按模型/TP 隔离输出，继续其余任务但任一失败最终非零；预览不打印调优成功 |
+| B11 remote code | 修复：配置加载和全部 wrapper 默认关闭，CLI 或 `TRUST_REMOTE_CODE=1` 显式启用 |
+| B12 参数/layout/preflight | 修复：正数、合法 TP、K grouping、fused block 对齐、自动 adapter 方形 block 限制（当前 Fp8Config 的激活分组约束）、quant metadata；只 gate CUDA FP8 实际 imports/helper/signature/native FP8 SM；GPU 编译仍需实测 |
+| B13 文件名/环境身份/消费 | 文件名和 schema 用固定官方 helper/loader CPU 契约核对；调用已安装 helper；报告记录软件/kernel 身份；新增真实 `--verify-installed` 路径但本机未执行 |
+| B14 重复调优/可恢复性 | shape 去重，worker 数不超过 M 数，单 M 直接单 GPU；重跑可分 M 合并；未建立 checkpoint/resume 系统，不扩展 scope |
+| B15 文档 | README/README_zh 对齐；撤下营销式模型列表/任意 custom 支持；明确 legacy、TP/M、backend gate、输出路径、覆盖策略、证据级别；AWQ 文档历史说明 |
+| B16 测试基线 | 新增 CPU/Shell/source-contract/可选 CUDA suite，以及 CPU GitHub Actions（Python3.10/3.13）；本机只执行 Python3.13，本地验收时远程 CI 尚未运行；PR 的最新 CI 状态以 GitHub Checks 为准 |
+| B17 License/卫生 | 使用完整官方 [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0.txt)，保留 SPDX/来源并增 NOTICE；取消忽略所有 JSON；tree 对应实际结构 |
+
+## 真实测试结果
+
+本机：macOS，Python `3.13.13`，未安装 `torch`、`vllm`、`triton`、`transformers`；无可用 NVIDIA CUDA 环境。
+
+| 检查 | 结果 |
+| --- | --- |
+| `python3 -m pytest -q` | **83 passed, 1 skipped**；约12秒。70项 CPU/unit/源码契约和13项 Shell/迁移子进程测试；GPU 模块因 PyTorch 缺失整组 skip |
+| CPU shape/layout | TP1/2/4/8、head_dim 与 hidden 不同、KV replication、非法 TP/dimensions、fused gate/up、MoE dense/shared 存在性、routed 排除、未知/嵌套架构、配置加载失败、quant metadata/block/ignored layers |
+| CPU 调度/保存 | GPU>M、单 M、empty/duplicate 分配、完整/缺失 worker merge、单/多 worker exception、heterogeneous GPU 拒绝、shape 去重、成功完整保存+报告 |
+| CPU 数据安全 | disjoint merge、overlap 拒绝、显式覆盖保留其他 M、坏 JSON/重复 key 拒绝、dump/fsync/replace 故障不破坏原文件、8进程并发合并无丢失 |
+| CPU 计时/loader 契约 | event 中真实调用数与微秒算术；默认配置资源不足不重试、可运行默认独立复测/可胜出、全部候选失败/未知错误/correctness 错误传播；固定官方 default/signature/helper/loader；空白与斜杠规范化；真实主代码 cached-loader 源码身份读取 |
+| Shell | 单任务/env wrapper 传播 exit7、remote code 默认关闭/显式开启/非法值拒绝、batch 8任务继续并累计失败、batch 全成功；实际 shape/merge/writer 链路验证8个模型/TP任务隔离（默认根目录、环境变量、两种CLI形式）、重跑拒绝和显式 overwrite；DeepSeek 退出2、deprecated FP8 wrapper 预览 |
+| `python3 -m compileall -q ...` | 主入口/helper/薄wrapper/测试编译通过 |
+| `bash -n scripts/... examples/...` | 全部6个 Shell 文件语法检查通过 |
+| `git diff --check` | 通过 |
+| 主 CLI `--help`、显式 shape `--preview` | exit0；无需 CUDA/PyTorch/vLLM |
+| 本机 `scripts/environment_check.sh` | exit1：`Error: No module named 'torch'`，正确暴露环境不满足 |
+| 本机单 shape 实际 tuning 命令 | exit1：同上，没有调优成功信息或实际 GPU config |
+| GPU compile/correctness/tuning | **Not executed — GPU unavailable** |
+| 已安装 vLLM loader + public Triton wrapper | **Not executed — GPU unavailable**；CPU 官方源码 fixture 不能代替此项 |
+| 实际 FP8 模型 backend/serving 对照性能 | **Not executed — GPU unavailable** |
+| GitHub Actions / Python3.10 环境 | 本地验收时尚未运行；已新增 workflow，PR 的最新远程 CI 状态以 GitHub Checks 为准 |
+
+CPU 实测没有被包装成 GPU 或性能验收。没有生成、提供或宣称真实 GPU 提速数据。
+
+## 第二轮自查
+
+从实际最终实现、测试和两份 README 重新检查以下项：
+
+1. 自动 shape 只保留两个 adapter；无 generic/name substring/fallback；QKV、o_proj、fused MLP、MoE schedule 对应固定源码。
+2. Routed experts、router、LM head、shared gate 未被误写为正式优化范围；shared MLP 仍要求运行时真的选到 regular-linear Triton。
+3. Python exception、pool.map failure、缺失结果、Shell failure、report 写失败均不能进入成功输出；help/preview 不称 tuning success。
+4. 保存前全 worker 结果覆盖校验；跨运行 lock 保护 read/merge/write；原子失败保留旧 JSON。原子性是每个文件，不承诺跨 shape 事务。
+5. 文件名直接复用 installed helper；CPU fixture loader 能读取生成 schema；实际 GPU loader/wrapper 验证仍列为未执行。
+6. README 说明真实 CLI、默认目录、TP/M、dtype/layout、量化 metadata、锁文件、overlap 政策、closest M、loader cache/backend 条件。
+7. INT8/AWQ 从正式支持和 Quick Start 撤下，未开发其 kernel/调度/消费链路。
+8. 没有增加、适配或重构 ROCm/XPU；CUDA-only 明确保留。
+9. 仅增加一个 CPU helper、必要测试/报告/CI；未建立通用架构平台、数据库、大型 benchmark 框架或上游工作流。
+10. 测试覆盖本轮发现的风险。复查中另外修正了 Bash3 空数组 nounset、cached-loader `__code__` 读取、K grouping/fused partition 对齐、当前 Fp8Config 非方形 block 的激活分组限制，并补相应回归。
+
+## Reviewer 发现后的定点修复
+
+上一轮 73 项测试没有覆盖两个真实流程缺陷，不能作为这两项已正确的证据。本次按用户授权仅修复这两项：
+
+- **Batch 输出冲突**：Qwen3-8B TP=4 的 gate/up `(6144,4096)` 与 TP=1 的 QKV 重合，TP=8 的 gate/up `(3072,4096)` 与 TP=2 的 QKV 重合。旧示例共享输出目录，即使首次运行也会失败。现在每个模型/TP 使用独立目录；`SAVE_PATH`/`--save-path` 是 batch 根目录（CLI优先）。新增子进程回归只 mock GPU worker/依赖，真实运行 shape、merge、writer，验证全部8任务、重跑拒绝及显式覆盖。
+- **资源不足 default 重试**：旧搜索跳过 `OutOfResources` default 后仍把它加入 finalists，导致有效候选被整体失败丢弃。现在仅把可运行 default 加入复测；报告另有 `baseline.status=unavailable` 和错误原因，或 `validated` 与复测结果。新增回归验证不重试、default 在前三名之外仍复测/仍可胜出、没有有效候选及未知/数值错误继续失败。
+
+先新增回归并确认旧实现失败，再修复。最新总计 **83 passed, 1 skipped**，Python 编译、全部6个 Shell 语法检查及 diff 检查通过；GPU 验证状态没有变化。此前“修复完成”的结论应以本次补充记录为准。
+
+## 剩余风险与下一阶段条件
+
+1. 必须在目标 NVIDIA CUDA 主机执行 `tests/test_gpu.py`，对具体 vLLM build/设备完成编译、数值验证和至少一次真实调优。当前 tolerance 和 eager event 测量可靠性只有设计/CPU 算术证据，没有 GPU 实测。
+2. 安装配置后，在新进程执行 README 的 `--verify-installed`，随后确认真实模型服务选择 `TritonFp8BlockScaledMMKernel` 并消费目标 shapes/config；其他 backend 不一定读本配置。
+3. 不同 vLLM kernel、output dtype、设备/layout 的性能兼容性不能仅靠同名 JSON 保证；用独立输出目录并查看报告身份。当前只做语法/layout 合并兼容检查，未做跨版本性能兼容认证。
+4. 写入按文件原子；文件系统需支持 advisory lock/atomic replace。报告或后续 shape 保存失败可能留下此前已完成配置，流程返回失败且不声称整体成功。
+
+**Not ready for upstream PR investigation**：代码修复、CPU/Shell 回归和第二轮自查已完成，但缺真实 CUDA kernel/loader/serving 证据，尚不能声称目标 GPU 路径完成验收。没有创建 upstream PR。

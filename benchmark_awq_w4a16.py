@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from sglang quantization/tuning_block_wise_kernel.py
+# LEGACY / EXPERIMENTAL / CURRENTLY NOT MAINTAINED.
+# Not part of the validated CUDA W8A8 Block FP8 workflow.
 
 """
 AWQ (W4A16) Triton Kernel Tuning Script

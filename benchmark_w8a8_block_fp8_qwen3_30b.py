@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from sglang quantization/tuning_block_wise_kernel.py
+# LEGACY / EXPERIMENTAL / CURRENTLY NOT MAINTAINED.
+# Not part of the validated CUDA W8A8 Block FP8 workflow.
 
+# Historical filename is misleading: this script runs INT8 W8A8, not FP8 or W8A16.
 import argparse
 import json
 import multiprocessing as mp
