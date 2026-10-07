@@ -1,5 +1,7 @@
 # AWQ (W4A16) Triton Kernel Tuning Script
 
+> **Legacy / experimental / currently not maintained.** This document describes historical code, outside the maintained CUDA W8A8 Block FP8 workflow. Compatibility, numerical correctness and production consumption have not been validated.
+
 ## Description
 
 This script (`benchmark_awq_w4a16.py`) is designed to tune the AWQ (Activation-aware Weight Quantization) Triton kernel for W4A16 quantization (4-bit weights, 16-bit activations) in vLLM. It performs automated kernel parameter search to find optimal configurations for different weight shapes and batch sizes.
@@ -113,12 +115,7 @@ To modify for other models, update the `get_weight_shapes()` function in the scr
 
 ## Integration with vLLM
 
-After tuning, copy the generated configuration files to:
-```
-vllm/model_executor/layers/quantization/utils/configs/
-```
-
-vLLM will automatically use these configurations when running AWQ-quantized models.
+The historical AWQ script writes a custom JSON format. The source-audited vLLM AWQ runtime does not load these files automatically. Copying them into the FP8 config directory does not enable AWQ tuning results. A production consumer would need separate work, which is outside this repair scope.
 
 ## Notes
 

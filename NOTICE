@@ -1,0 +1,7 @@
+vLLM Block FP8 Kernel Tuning Tool
+Copyright 2024 vLLM Block FP8 Kernel Tuning Contributors
+
+Includes benchmark code adapted from the vLLM project and sglang
+quantization/tuning_block_wise_kernel.py. Existing SPDX and source notices
+are retained. Repository-specific modifications add strict shape planning,
+safe config persistence, validated measurements, and maintained entry points.
