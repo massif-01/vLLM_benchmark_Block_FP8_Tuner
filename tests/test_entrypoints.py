@@ -336,3 +336,10 @@ sys.exit(bench.cli())
     result = subprocess.run([*command, '--overwrite'], env=env, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert 'completed successfully' in result.stdout
+
+
+def test_single_call_is_default_benchmark_semantics():
+    import inspect
+    args = bench.build_parser().parse_args(['--shape','128','256'])
+    assert args.calls_per_event == 1
+    assert inspect.signature(bench.benchmark_config).parameters['calls_per_event'].default == 1

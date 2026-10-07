@@ -73,9 +73,12 @@ def test_duplicates():
     assert core.unique_shapes([(128,256),(128,256),(256,128)]) == [(128,256),(256,128)]
 
 
-@pytest.mark.parametrize('sizes,gpus,expected', [([1],8,[[1]]),([1,2,4],2,[[1],[2,4]]),([1,2],8,[[1],[2]])])
-def test_distribution(sizes,gpus,expected):
-    assert core.distribute_batch_sizes(sizes,gpus) == expected
+@pytest.mark.parametrize('sizes,gpus', [([1],8),([1,2,4],2),([1,2],8)])
+def test_distribution(sizes,gpus):
+    assignments = core.distribute_batch_sizes(sizes,gpus)
+    assert len(assignments) == min(gpus,len(sizes)) and all(assignments)
+    assert sorted(m for batch in assignments for m in batch) == sorted(sizes)
+    assert assignments == core.distribute_batch_sizes(sizes,gpus)
 
 
 @pytest.mark.parametrize('sizes,gpus', [([],1),([1,1],2),([0],1),([1],0)])
@@ -94,7 +97,8 @@ def test_worker_merge():
 
 
 @pytest.mark.parametrize('partials,assigned', [([{}],[[1]]),([None],[[1]]),([{(128,256):{}}],[[]]),
-    ([{(128,256):{1:CFG}},{(128,256):{1:CFG}}],[[1],[1]])])
+    ([{(128,256):{1:CFG}},{(128,256):{1:CFG}}],[[1],[1]]),
+    ([{(128,256):{2:CFG}}],[[1]])])
 def test_bad_worker_results(partials,assigned):
     with pytest.raises(RuntimeError): core.merge_results(partials,assigned,[(128,256)])
 
@@ -150,3 +154,23 @@ def test_help_and_explicit_preview_without_gpu():
     assert result.returncode == 0, result.stderr
     preview=json.loads(result.stdout)
     assert preview['shapes'] == [[128,256]] and preview['M'] == [3]
+
+
+def test_default_batch_load_balance_and_completeness():
+    sizes = core.DEFAULT_BATCH_SIZES
+    assignments = core.distribute_batch_sizes(sizes,8)
+    assert len(assignments) == 8 and all(assignments)
+    assert sorted(m for batch in assignments for m in batch) == sorted(sizes)
+    assert all(batch == sorted(batch) for batch in assignments)
+    assert assignments == core.distribute_batch_sizes(sizes,8)
+    old = [sizes[i*len(sizes)//8:(i+1)*len(sizes)//8] for i in range(8)]
+    assert max(map(sum,assignments)) < max(map(sum,old))/2
+
+
+def test_balanced_assignments_preserve_parent_merge():
+    sizes = core.DEFAULT_BATCH_SIZES
+    assignments = core.distribute_batch_sizes(sizes,8)
+    shapes = [(128,256),(256,128)]
+    partials = [{shape:{m:CFG for m in batch} for shape in shapes} for batch in assignments]
+    merged = core.merge_results(partials,assignments,shapes)
+    assert all(set(configs) == set(sizes) for configs in merged.values())

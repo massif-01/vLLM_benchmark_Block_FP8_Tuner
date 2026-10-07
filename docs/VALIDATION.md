@@ -2,7 +2,7 @@
 
 核验日期：2026-10-08（Asia/Shanghai）。仓库起点 HEAD：`03af15286e5e2c643f8bbcd61bc64bbc43dfbd90`；开始时工作区干净。本地修复验收时，修改保留在工作区，尚未 commit/push。随后用户授权将这些改动通过独立分支 PR 提交到自己的仓库供进一步审查；不直接提交到默认分支、不合并 PR。未修改任何 vLLM checkout，未创建 vLLM upstream issue/PR。
 
-本轮以用户 Goal 为最高优先级。实施说明和审查报告仅作为参考/证据：CUDA-only 是产品边界；只维护 W8A8 Block FP8 主路径；INT8/AWQ 不做功能开发。
+初始修复以用户 Goal 为最高优先级；后续独立 Review 修复以对应的新指令为准，不重新执行原 Goal。实施说明和审查报告仅作为参考/证据：CUDA-only 是产品边界；只维护 W8A8 Block FP8 主路径；INT8/AWQ 不做功能开发。
 
 ## 独立核对来源
 
@@ -32,7 +32,7 @@ GitHub API 查询当前 vLLM main 后，固定以下 commit 下载并检查相�
 | B11 remote code | 修复：配置加载和全部 wrapper 默认关闭，CLI 或 `TRUST_REMOTE_CODE=1` 显式启用 |
 | B12 参数/layout/preflight | 修复：正数、合法 TP、K grouping、fused block 对齐、自动 adapter 方形 block 限制（当前 Fp8Config 的激活分组约束）、quant metadata；只 gate CUDA FP8 实际 imports/helper/signature/native FP8 SM；GPU 编译仍需实测 |
 | B13 文件名/环境身份/消费 | 文件名和 schema 用固定官方 helper/loader CPU 契约核对；调用已安装 helper；报告记录软件/kernel 身份；新增真实 `--verify-installed` 路径但本机未执行 |
-| B14 重复调优/可恢复性 | shape 去重，worker 数不超过 M 数，单 M 直接单 GPU；重跑可分 M 合并；未建立 checkpoint/resume 系统，不扩展 scope |
+| B14 重复调优/可恢复性 | shape 去重，worker 数不超过 M 数，单 M 直接单 GPU；M 使用 deterministic LPT/greedy 分配；重跑可分 M 合并；未建立 checkpoint/resume 系统，不扩展 scope |
 | B15 文档 | README/README_zh 对齐；撤下营销式模型列表/任意 custom 支持；明确 legacy、TP/M、backend gate、输出路径、覆盖策略、证据级别；AWQ 文档历史说明 |
 | B16 测试基线 | 新增 CPU/Shell/source-contract/可选 CUDA suite，以及 CPU GitHub Actions（Python3.10/3.13）；本机只执行 Python3.13，本地验收时远程 CI 尚未运行；PR 的最新 CI 状态以 GitHub Checks 为准 |
 | B17 License/卫生 | 使用完整官方 [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0.txt)，保留 SPDX/来源并增 NOTICE；取消忽略所有 JSON；tree 对应实际结构 |
@@ -43,7 +43,7 @@ GitHub API 查询当前 vLLM main 后，固定以下 commit 下载并检查相�
 
 | 检查 | 结果 |
 | --- | --- |
-| `python3 -m pytest -q` | **83 passed, 1 skipped**；约12秒。70项 CPU/unit/源码契约和13项 Shell/迁移子进程测试；GPU 模块因 PyTorch 缺失整组 skip |
+| `python3 -m pytest -q` | **131 passed, 1 skipped**；约12秒。118项 CPU/unit/源码契约和13项 Shell/迁移子进程测试；GPU 模块因 PyTorch 缺失整组 skip |
 | CPU shape/layout | TP1/2/4/8、head_dim 与 hidden 不同、KV replication、非法 TP/dimensions、fused gate/up、MoE dense/shared 存在性、routed 排除、未知/嵌套架构、配置加载失败、quant metadata/block/ignored layers |
 | CPU 调度/保存 | GPU>M、单 M、empty/duplicate 分配、完整/缺失 worker merge、单/多 worker exception、heterogeneous GPU 拒绝、shape 去重、成功完整保存+报告 |
 | CPU 数据安全 | disjoint merge、overlap 拒绝、显式覆盖保留其他 M、坏 JSON/重复 key 拒绝、dump/fsync/replace 故障不破坏原文件、8进程并发合并无丢失 |
@@ -55,9 +55,9 @@ GitHub API 查询当前 vLLM main 后，固定以下 commit 下载并检查相�
 | 主 CLI `--help`、显式 shape `--preview` | exit0；无需 CUDA/PyTorch/vLLM |
 | 本机 `scripts/environment_check.sh` | exit1：`Error: No module named 'torch'`，正确暴露环境不满足 |
 | 本机单 shape 实际 tuning 命令 | exit1：同上，没有调优成功信息或实际 GPU config |
-| GPU compile/correctness/tuning | **Not executed — GPU unavailable** |
-| 已安装 vLLM loader + public Triton wrapper | **Not executed — GPU unavailable**；CPU 官方源码 fixture 不能代替此项 |
-| 实际 FP8 模型 backend/serving 对照性能 | **Not executed — GPU unavailable** |
+| GPU compile/correctness/tuning | **Not executed — CUDA GPU unavailable** |
+| 已安装 vLLM loader + public Triton wrapper | **Not executed — CUDA GPU unavailable**；CPU 官方源码 fixture 不能代替此项 |
+| 实际 FP8 模型 backend/serving 对照性能 | **Not executed — CUDA GPU unavailable** |
 | GitHub Actions / Python3.10 环境 | 本地验收时尚未运行；已新增 workflow，PR 的最新远程 CI 状态以 GitHub Checks 为准 |
 
 CPU 实测没有被包装成 GPU 或性能验收。没有生成、提供或宣称真实 GPU 提速数据。
@@ -85,6 +85,28 @@ CPU 实测没有被包装成 GPU 或性能验收。没有生成、提供或宣�
 - **资源不足 default 重试**：旧搜索跳过 `OutOfResources` default 后仍把它加入 finalists，导致有效候选被整体失败丢弃。现在仅把可运行 default 加入复测；报告另有 `baseline.status=unavailable` 和错误原因，或 `validated` 与复测结果。新增回归验证不重试、default 在前三名之外仍复测/仍可胜出、没有有效候选及未知/数值错误继续失败。
 
 先新增回归并确认旧实现失败，再修复。最新总计 **83 passed, 1 skipped**，Python 编译、全部6个 Shell 语法检查及 diff 检查通过；GPU 验证状态没有变化。此前“修复完成”的结论应以本次补充记录为准。
+
+## PR #3 独立 Review 定点修复（本次）
+
+保留现有 CPU helper + CUDA CLI 分层、parent aggregation、官方 filename/schema 和 safe persistence；仅修改 exclusion 分类、单-call 默认计时和 M 负载分配。
+
+| Finding | 结果与证据 |
+| --- | --- |
+| P1 exclusion handling | **Fixed**：合并检查 `ignored_layers` 与 `modules_to_not_convert`；允许明确非目标模块/参数及 scoped `*`，拒绝 target projection、宽泛父级和无法识别的 pattern，指出具体 exclusion 和显式 shape 路径。router `mlp.gate` 与 target `mlp.gate_proj` 按完整组件区分；不加入 router/routed expert tuning |
+| P2 calls_per_event | **Fixed**：函数和 parser 默认 1，保留显式 >1 repeated-call 平均测量；已有 1/10 call 微秒算术和手动 event 调用数测试保留，新增默认值断言 |
+| P2 multi-GPU balancing | **Fixed**：M 成本 proxy 的 deterministic LPT/greedy，各 bin 内升序；默认18个M/8GPU的旧 loads 为 `[3,12,40,144,224,768,2560,9216]`，新 loads 为 `[4096,3072,2048,1536,1024,512,340,339]`，最大估计负载从9216降至4096；完整/唯一分配与 parent merge 回归通过 |
+| Provenance 系统 | **Deferred**：保留独立目录警告；没有新增数据库、metadata framework、schema migration |
+| Hardware gate | **Not executed — CUDA GPU unavailable**；保持 Draft，不满足 ready-for-merge 条件 |
+
+官方配置仅下载 JSON，无模型权重/remote code，固定 revision [`dcaee4d4dfc5ee71ad501f01f530e5652438fde0`](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8/raw/dcaee4d4dfc5ee71ad501f01f530e5652438fde0/config.json)。保存为 `tests/fixtures/qwen3_coder_fp8_config.json`（SHA256 `2705ed03bb322c864470bc282738b4713daca31b54ee4a639fe198bd7b9523f4`）。离线读取其真实145项 exclusions，实际 planner/metadata/layout 校验通过，TP4 为 `(1280,2048)`、`(2048,1024)`；此结果**不是** vLLM CLI/model preview 或 GPU pass。
+
+先新增回归，确认旧实现拒绝官方风格 exclusions、漏查第二字段、默认 calls=10、旧分配仍最大load9216；再修改实现。完整本地套件 **131 passed, 1 skipped**；Python3.13.13 编译、全部6个 Shell 语法、diff 检查通过。Python3.10 本机未安装，使用本次 PR head 的 GitHub CI 验证，最终状态以 Checks 为准。所有原有语义回归保留，原 distribution 的脆弱 exact-list 断言改为同输入的完整/唯一/worker数/deterministic 断言，另增 default-load 与 parent-merge 回归。
+
+第二轮自审确认：官方 exclusions 允许；checkpoint/fused/shared projections 与父级范围仍拒绝；gate/gate_proj 区分；两字段均检查；default calls=1；LPT 分配确定且完整；aggregation/filename/schema/lock/temp/fsync/replace 没有改动；英中 README 一致；INT8/AWQ/ROCm/XPU 未扩展；未增加架构/manifest 系统；GPU 不隐含通过。
+
+目标 GPU 上的 preflight、smoke、installed-loader/public-wrapper、官方 model preview、1/10 calls 对照的准确命令见 [CUDA_VALIDATION.md](CUDA_VALIDATION.md)。本机 actual vLLM CLI model preview 因 vLLM/PyTorch 未安装而未执行；单-call vs repeated-call GPU 的 winner/ranking/median 对照也未执行。
+
+**Ready for independent re-review**：三项范围内代码修复和 CPU/Shell 回归已完成，硬件 gate 仍明确未通过；此结论不等于 ready for merge。
 
 ## 剩余风险与下一阶段条件
 

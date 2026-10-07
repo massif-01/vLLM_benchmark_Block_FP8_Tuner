@@ -150,7 +150,7 @@ def default_config(block_n, block_k):
                 GROUP_SIZE_M=32, num_warps=4, num_stages=2)
 
 
-def benchmark_config(A, B, As, Bs, block_size, config, out_dtype, num_iters=5, calls_per_event=10):
+def benchmark_config(A, B, As, Bs, block_size, config, out_dtype, num_iters=5, calls_per_event=1):
     C = A.new_empty((A.shape[0], B.shape[0]), dtype=out_dtype)
     def run():
         w8a8_block_matmul(A, B, As, Bs, block_size, config, out_dtype, output=C)
@@ -279,7 +279,8 @@ def build_parser():
     parser.add_argument('--verify-installed',action='store_true',help='Check installed vLLM loader and run its public Triton wrapper against saved config')
     parser.add_argument('--seed',type=int,default=0)
     parser.add_argument('--measurements',type=int,default=5)
-    parser.add_argument('--calls-per-event',type=int,default=10)
+    parser.add_argument('--calls-per-event',type=int,default=1,
+                        help='Kernel calls per CUDA event; >1 explicitly measures repeated-call averages')
     return parser
 
 

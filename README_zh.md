@@ -17,7 +17,7 @@
 
 自动 shape detection 只针对显式支持的 architecture。未知架构明确失败，不回退到无关尺寸；不以模型名包含 “Qwen” 判断 adapter。支持 MoE 模型的部分普通 linear **不等于调优 routed expert kernel**。
 
-Adapter 确认的是普通 linear 的维度，不证明每层都量化，也不证明 serving 引擎选用了本 Triton backend。有 checkpoint 量化元数据时，自动推导仅接受 dynamic `fp8`，且 `weight_block_size` 必须匹配。无法映射的 ignored-layer patterns 会拒绝（仅排除 `lm_head` 可以接受）。无量化元数据时，预览/报告会明确提示仍需确认实际 FP8 和 backend。其他量化格式只有在真实到达相同 kernel/layout 时，才可用显式观测 shape。
+Adapter 确认的是普通 linear 的维度，不证明每层都量化，也不证明 serving 引擎选用了本 Triton backend。有 checkpoint 量化元数据时，自动推导仅接受 dynamic `fp8`，且 `weight_block_size` 必须匹配。同时检查 `ignored_layers` 和 `modules_to_not_convert`。明确非目标 exclusion（LM head、embedding、layernorm、Q/K norm、MoE router `mlp.gate`、shared-expert gate、routed-expert 子树和 bias 参数）允许；checkpoint/fused runtime 名称中的目标 projection、宽泛父级范围及无法识别的 pattern 仍 fail closed，错误会指出具体 exclusion 和 `--shape N K` 路径。小分类器只识别字面名称/分段 `*`，不实现任意正则 pattern。无量化元数据时，预览/报告会明确提示仍需确认实际 FP8 和 backend。其他量化格式只有在真实到达相同 kernel/layout 时，才可用显式观测 shape。
 
 仓库保留历史/实验性 INT8 和 AWQ 脚本，但它们**不属于当前维护和验证的工作流**，不推荐作为入口；不维护其兼容性、正确性和 runtime 配置消费能力。本项目不提供 ROCm/XPU 支持。
 
@@ -66,9 +66,9 @@ bash scripts/tune_qwen3.sh Qwen/Qwen3-8B 4 128 128
 | `--verify-installed` | 比较保存文件与已安装 loader 结果并运行其公开 Triton wrapper；不验证 serving backend 选择 |
 | `--seed` | 非负合成输入种子，默认 `0` |
 | `--measurements` | CUDA event 测量轮数，默认 `5` |
-| `--calls-per-event` | 每个 event 内实际 kernel 调用数，默认 `10` |
+| `--calls-per-event` | 每个 event 内实际 kernel 调用数，默认 `1`；显式 >1 测量 repeated-call 平均值 |
 
-M 是 GEMM 的 M 维度，不一定等于并发 serving request 数。TP 改变目标模型切分尺寸；调优 worker 数独立取 `min(可见 CUDA GPU 数, 请求 M 数)`。只有一个 M 时没有可并行的 M 任务，因此使用一个 GPU。参与 GPU 必须同型号。重复 shape 只调一次；worker 空任务、缺失、重复或意外结果都会在保存前中止。
+M 是 GEMM 的 M 维度，不一定等于并发 serving request 数。TP 改变目标模型切分尺寸；调优 worker 数独立取 `min(可见 CUDA GPU 数, 请求 M 数)`。只有一个 M 时没有可并行的 M 任务，因此使用一个 GPU。以 M 为成本 proxy，用 deterministic LPT/greedy 分配，各 worker 内 M 按升序记录。参与 GPU 必须同型号。重复 shape 只调一次；worker 空任务、缺失、重复或意外结果都会在保存前中止。
 
 QKV 使用 `local_q = Q_heads / TP`、`local_kv = max(1, KV_heads / TP)`，`N = (local_q + 2*local_kv)*head_dim`、`K = hidden_size`。Attention output 的 `K = local_q*head_dim`，不必等于 `hidden_size/TP`。严格验证 Q/KV 分片或复制关系。普通融合 gate/up 使用 `N = 2*intermediate_size/TP`，仅在对应架构实际构造该 MLP 时生成。不会从 `moe_intermediate_size` 推测 routed expert 尺寸。也会检查 runtime K 分组和 fused partition block 对齐。自动 adapter 当前要求方形 FP8 block：核对的 `Fp8Config` 用 block N 生成激活分组，而目标 GEMM 预期 block K。非方形布局必须使用显式观测的 `--shape`，并确认真实调用方提供正确 scales。
 
@@ -82,7 +82,7 @@ bash scripts/tune_custom.sh Qwen/Qwen3-8B 4 128 128 --preview
 
 ## 测量与保存
 
-每个候选先编译并预热五次，再以预分配输出 buffer 进行多轮 eager CUDA event 测量。时间为 `elapsed_ms * 1000 / calls_per_event`，单位微秒。搜索按中位数排序；成功候选中的前三名，以及源码核对的默认配置（可运行时），在同一批 tensor 上独立复测，并与同一 A/B/scales 反量化后的 FP32 matmul 比较（`rtol=0.02`、`atol=0.02`，要求有限值）。复测中位数最低者胜出，默认配置也可能胜出。默认配置出现 `OutOfResources` 时不再重试，报告记录 `baseline.status=unavailable` 及原因；可运行的默认配置记录 `baseline.status=validated` 和独立复测结果。仅跳过 Triton `OutOfResources` 候选；未知编译/runtime/数值错误直接失败。这是 sanity check，不证明模型精度或全局最优。
+每个候选先编译并预热五次，再以预分配输出 buffer 进行多轮 eager CUDA event 测量。默认每个 event 仅执行一次 GEMM，直接换算微秒，不额外除以调用数。显式 `--calls-per-event >1` 测量 repeated-call 平均值，换算为 `elapsed_ms * 1000 / calls_per_event`。重复调用会改变 workload/cache 行为，可能改变配置排名，不能与单次调用 latency 混为一谈。搜索按中位数排序；成功候选中的前三名，以及源码核对的默认配置（可运行时），在同一批 tensor 上独立复测，并与同一 A/B/scales 反量化后的 FP32 matmul 比较（`rtol=0.02`、`atol=0.02`，要求有限值）。复测中位数最低者胜出，默认配置也可能胜出。默认配置出现 `OutOfResources` 时不再重试，报告记录 `baseline.status=unavailable` 及原因；可运行的默认配置记录 `baseline.status=validated` 和独立复测结果。仅跳过 Triton `OutOfResources` 候选；未知编译/runtime/数值错误直接失败。这是 sanity check，不证明模型精度或全局最优。
 
 成功运行另存 `reports/<UTC timestamp>-<id>.json`，记录 seed、软件/kernel 源码 hash、设备、shape/来源层、输出 dtype、量化布局、finalist 样本和误差、默认配置对照、资源不足计数。官方 config 只存 M 到 launch config 的映射。
 
@@ -113,6 +113,8 @@ python3 benchmark_w8a8_block_fp8.py --shape 128 256 --batch-size 17 \
 
 源码契约于 2026-10-08 对照 vLLM main commit [`c741bfca70cfb777e2016f827eae31f6e215fe9f`](https://github.com/vllm-project/vllm/tree/c741bfca70cfb777e2016f827eae31f6e215fe9f)。这是源码兼容性参考，**不是** GPU 实测版本保证。[验证记录](docs/VALIDATION.md)包含固定 kernel/adapter/loader 来源和剩余硬件验收项。
 
+真实 CUDA 验收是独立于 CPU CI 的**合并 gate**；硬件 gate 未满足前 PR 保持 Draft。完整 preflight、小 shape 调优、installed-loader/public-wrapper、官方模型 preview 以及 1/10 calls 对照命令见 [CUDA 验收步骤](docs/CUDA_VALIDATION.md)。
+
 ## 测试与旧入口迁移
 
 ```bash
@@ -121,7 +123,7 @@ python3 -m pytest -q
 python3 -m pytest -q tests/test_gpu.py
 ```
 
-可选 GPU 套件在临时目录隔离已安装 loader 的配置路径，不修改已安装 vLLM 源码。本机为 **Not executed — GPU unavailable**（同时未安装 PyTorch/vLLM）。CPU unit/源码契约及 Shell 子进程结果见 [docs/VALIDATION.md](docs/VALIDATION.md)，不编造 GPU 提速数据。
+可选 GPU 套件在临时目录隔离已安装 loader 的配置路径，不修改已安装 vLLM 源码。本机为 **Not executed — CUDA GPU unavailable**（同时未安装 PyTorch/vLLM）。CPU unit/源码契约及 Shell 子进程结果见 [docs/VALIDATION.md](docs/VALIDATION.md)，不编造 GPU 提速数据。
 
 `benchmark_w8a8_block_fp8_qwencoder.py` 改为 deprecated 薄 wrapper，要求与主入口相同的显式来源参数。`scripts/tune_deepseek_v3.sh` 现在非零退出并提示改用观测的 `--shape N K`。旧 `...qwen3_30b.py` 和 `...qwen3omni_talker.py` 实际运行 INT8 W8A8，与文件名不符；保留历史标记，不重定向成 FP8。[README_AWQ.md](README_AWQ.md) 是历史文档，其自定义 JSON 在核对的 vLLM AWQ runtime 中没有自动消费者。
 

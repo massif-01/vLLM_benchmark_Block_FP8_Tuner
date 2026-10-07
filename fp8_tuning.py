@@ -112,6 +112,51 @@ def load_model_shapes(model, tp_size, trust_remote_code=False, loader=None):
     return config, shapes, sources
 
 
+def validate_quantization_exclusions(quant):
+    """Allow only exclusions proven outside our regular-linear targets.
+
+    Recognize literal module components and scoped '*' components, not arbitrary
+    regex/glob expressions. Unknown or broad patterns remain fail closed.
+    """
+    exclusions = []
+    for name in ('ignored_layers', 'modules_to_not_convert'):
+        values = field(quant, name)
+        if values is None:
+            continue
+        if not isinstance(values, (list, tuple)):
+            raise ValueError(f'{name} must be a list of exclusions; use observed --shape N K')
+        for pattern in values:
+            if not isinstance(pattern, str) or not pattern:
+                raise ValueError(f'Invalid exclusion {pattern!r} in {name}; use observed --shape N K')
+            if pattern not in exclusions:
+                exclusions.append(pattern)
+
+    safe_modules = {'lm_head', 'embed_tokens', 'input_layernorm',
+                    'post_attention_layernorm', 'q_norm', 'k_norm'}
+    projections = {'q_proj', 'k_proj', 'v_proj', 'qkv_proj', 'o_proj',
+                   'gate_proj', 'up_proj', 'gate_up_proj', 'down_proj'}
+    for pattern in exclusions:
+        parts = pattern.split('.')
+        simple = all(p == '*' or p.replace('_', '').isalnum() for p in parts)
+        if simple:
+            if parts[-1] == 'bias':
+                continue  # A bias parameter does not exclude a GEMM weight.
+            if parts[-1] in ('weight', '*'):
+                parts = parts[:-1]
+            if parts and parts[-1] in safe_modules:
+                continue
+            # MoE router gate is outside scope; gate_proj is a target projection.
+            if parts[-2:] in (['mlp', 'gate'], ['mlp', 'shared_expert_gate']):
+                continue
+            if any(parts[i:i+2] == ['mlp', 'experts'] for i in range(len(parts)-1)):
+                continue  # Routed expert subtree; never the shared regular MLP.
+        reason = ('names a target projection (including checkpoint/fused aliases)'
+                  if parts and parts[-1] in projections else
+                  'is broad or cannot be proven outside target regular-linears')
+        raise ValueError(f'Exclusion {pattern!r} {reason}; auto shape detection cannot '
+                         'confirm the target kernel path. Use observed --shape N K')
+
+
 def validate_model_quantization(config, block_n, block_k):
     # Source-audited Fp8Config uses block_n for activation grouping, while the
     # target GEMM expects block_k. Do not promise its non-square runtime path.
@@ -124,10 +169,7 @@ def validate_model_quantization(config, block_n, block_k):
         raise ValueError('Auto detection requires dynamic W8A8 FP8 checkpoint metadata, or no quantization metadata')
     if field(quant, 'weight_block_size') != [block_n, block_k]:
         raise ValueError('Checkpoint weight_block_size does not match --block-n/--block-k')
-    # An ignored regular layer can remove a shape. Refuse rather than guess the mapping.
-    ignored = field(quant, 'ignored_layers', []) or field(quant, 'modules_to_not_convert', [])
-    if ignored and ignored != ['lm_head']:
-        raise ValueError('Auto detection does not map ignored layer patterns; use observed --shape N K')
+    validate_quantization_exclusions(quant)
     return 'FP8 metadata matches; runtime must still select the Triton regular-linear backend.'
 
 
@@ -138,8 +180,14 @@ def distribute_batch_sizes(batch_sizes, num_gpus):
     for m in batch_sizes:
         positive(m, 'M')
     workers = min(num_gpus, len(batch_sizes))
-    return [batch_sizes[i * len(batch_sizes) // workers:(i + 1) * len(batch_sizes) // workers]
-            for i in range(workers)]
+    bins = [[] for _ in range(workers)]
+    loads = [0] * workers
+    # Deterministic LPT: M is a simple cost proxy, with GPU index breaking ties.
+    for m in sorted(batch_sizes, reverse=True):
+        i = min(range(workers), key=lambda i: (loads[i], i))
+        bins[i].append(m)
+        loads[i] += m
+    return [sorted(batch) for batch in bins]
 
 
 def validate_launch(config, block_k=None):
