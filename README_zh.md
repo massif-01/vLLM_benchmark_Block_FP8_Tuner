@@ -1,151 +1,264 @@
-# CUDA vLLM W8A8 Block FP8 调优工具
+# vLLM Block FP8 Tuner
 
-[English](README.md) | [中文](README_zh.md)
+**面向 CUDA W8A8 Block FP8 普通线性层的 Triton Kernel 调优工具**
 
-本项目是 **CUDA-only vLLM W8A8 Block FP8 Triton kernel tuning tool**。正式维护入口为 `benchmark_w8a8_block_fp8.py`：调优普通二维 linear GEMM，校验 finalists 的数值结果，完整合并请求的 M，并安全保存 vLLM 格式配置。不承诺必然提速，也不代表优化了整个模型。
+[English](README.md) · [简体中文](README_zh.md)
 
-## 范围与证据
+为 vLLM 的 W8A8 Block FP8 Triton 矩阵乘法内核搜索合适的启动参数，对候选结果进行数值校验，并生成 vLLM 可读取的 JSON 配置。支持利用多张 NVIDIA GPU 并行调优不同的 `M`，由主进程统一合并结果，避免多进程互相覆盖文件。
 
-| 能力 | 当前范围与验证等级 |
+这是一个**独立维护的调优工具**，并非 vLLM 官方组件。它测量的是独立 GEMM 内核，不是完整模型推理；生成配置也不意味着实际服务一定提速。
+
+> **当前验证状态：** 已审查版本的 CPU、CLI 和 Shell 回归测试通过；真实 CUDA 编译、数值调优、已安装 vLLM Loader 集成和模型服务性能**尚未完成验收**。在目标设备通过 [CUDA 验收流程](docs/CUDA_VALIDATION.md)前，不应把生成结果视为已经具备生产环境验证证据。
+
+## 这个工具做什么
+
+```text
+模型配置 ──→ Qwen3 普通线性层的各 TP rank 形状 ──┐
+                                                 ├─→ 调优 (M, N, K)
+已实际观测的单 rank (N, K) ──────────────────────┘           │
+                                                           ▼
+                                              测量 Triton 启动参数候选
+                                                           │
+                                                           ▼
+                                               独立复测与数值正确性校验
+                                                           │
+                                                           ▼
+                                               主进程合并所有 GPU 结果
+                                                           │
+                                                           ▼
+                                               写出 vLLM 格式的 JSON
+```
+
+- **理解模型结构：** 针对 `Qwen3ForCausalLM` 和 `Qwen3MoeForCausalLM` 推导真实的 TP 分片形状，处理 GQA、KV 复制以及实际存在的普通 dense/shared MLP。
+- **支持手工指定形状：** 对不适合自动推导的场景，使用已观测的单 rank `(N, K)` 直接调优。
+- **多 GPU 并行：** 按 `M` 划分工作，每个 worker 返回结果；主进程检查完整性并统一保存。
+- **保护已有配置：** 不同的 `M` 可以安全合并，重复 `M` 默认拒绝覆盖；文件更新受锁保护，并使用原子替换。
+- **留下验证证据：** 对入围配置使用同一批 FP8 数据和反量化 FP32 参考结果做数值检查；测量、误差和软件/内核身份写入独立报告。
+
+### 维护范围
+
+| 正式支持 | 不属于当前维护范围 |
 | --- | --- |
-| 设备 | NVIDIA CUDA，原生 FP8 compute capability >= 8.9；需要 CUDA PyTorch、vLLM 和 Triton |
-| 内核 | 已安装 vLLM 的 `_w8a8_triton_block_scaled_mm`；A/B 为 FP8 E4M3FN，scale 为 FP32；输出 FP16、BF16 或 FP32 |
-| 自动 dense adapter | `Qwen3ForCausalLM`：GQA QKV、attention output、融合 gate/up、down projection |
-| 部分 MoE adapter | `Qwen3MoeForCausalLM`：attention，以及根据真实 layer schedule 确认存在的普通 dense/shared MLP |
-| 排除 | routed experts / fused MoE、LM head、router 和 shared-expert gate、Next/VL/Omni/嵌套配置、DeepSeek 自动推导、未知架构 |
-| 证据 | CPU shape/保存/入口及源码契约测试通过；本机 GPU 编译、数值/性能和 serving 验证仍为**未验证** |
+| Compute Capability **8.9 及以上**的 NVIDIA CUDA GPU | 更早的 GPU；ROCm、XPU、CPU 调优 |
+| 已安装 vLLM 的 W8A8 Block FP8 **Triton 普通线性层**内核 | Routed/Fused MoE 专家内核调优 |
+| Qwen3 Dense 与 Qwen3-MoE 的明确普通线性层 Adapter | 通用架构猜测；Qwen3-Next/VL/Omni、DeepSeek 自动推导 |
+| FP8 E4M3FN 输入、FP32 Scale；FP16/BF16/FP32 输出 | INT8 与 AWQ 功能开发（历史脚本保留但不维护） |
 
-自动 shape detection 只针对显式支持的 architecture。未知架构明确失败，不回退到无关尺寸；不以模型名包含 “Qwen” 判断 adapter。支持 MoE 模型的部分普通 linear **不等于调优 routed expert kernel**。
+**特别说明：** 支持 Qwen3-MoE 的部分普通线性层，**不代表**支持 Routed Expert 调优。能够算出某个 Linear 的形状，也不能证明实际运行的模型采用 Block FP8、或最终选择了 Triton 后端。后两项必须单独核实。
 
-Adapter 确认的是普通 linear 的维度，不证明每层都量化，也不证明 serving 引擎选用了本 Triton backend。有 checkpoint 量化元数据时，自动推导仅接受 dynamic `fp8`，且 `weight_block_size` 必须匹配。同时检查 `ignored_layers` 和 `modules_to_not_convert`。明确非目标 exclusion（LM head、embedding、layernorm、Q/K norm、MoE router `mlp.gate`、shared-expert gate、routed-expert 子树和 bias 参数）允许；checkpoint/fused runtime 名称中的目标 projection、宽泛父级范围及无法识别的 pattern 仍 fail closed，错误会指出具体 exclusion 和 `--shape N K` 路径。Planner 可对简单分段 `*` pattern 做保守安全分类；这是本工具分析 metadata 的约定，不代表已安装 vLLM 把字符串当成 glob，常规 FP8 路径采用 exact matching。分类器不实现 runtime glob/regex engine。无量化元数据时，预览/报告会明确提示仍需确认实际 FP8 和 backend。其他量化格式只有在真实到达相同 kernel/layout 时，才可用显式观测 shape。
+## 环境要求
 
-仓库保留历史/实验性 INT8 和 AWQ 脚本，但它们**不属于当前维护和验证的工作流**，不推荐作为入口；不维护其兼容性、正确性和 runtime 配置消费能力。本项目不提供 ROCm/XPU 支持。
+- 同一 Python 环境中安装**支持 CUDA 的 PyTorch、Triton，以及兼容的 vLLM**。依赖版本以实际安装的 vLLM 要求为准；本仓库不提供替代内核，也不承诺任意版本组合均可使用。
+- 真实调优需要 **SM 8.9+** 的 NVIDIA GPU。例如 RTX 4090（SM 8.9）和 H100（SM 9.0）符合硬件门槛；RTX A6000（SM 8.6）和 Jetson AGX Orin（SM 8.7）不符合。
+- 当前安装的 vLLM 必须具有相容的 FP8 私有 Triton 内核、配置 Loader 和设备命名接口。升级 vLLM 后，应重新执行环境检查。
+
+`--help` 和**显式形状**的 `--preview` 不依赖 CUDA、PyTorch 或 vLLM。使用 `--model` 预览时，需要能加载模型配置并调用 vLLM 的 dtype resolver；它不会下载模型权重，也不会执行 GPU Kernel 调优。
 
 ## 快速开始
 
-使用与已安装 vLLM 匹配的 CUDA 环境。CPU 规划/测试使用 Python 3.10+；GPU Python、PyTorch、Triton 要求遵循该 vLLM build。不内嵌旧 kernel 来绕过导入失败。
+以下命令均从仓库根目录运行。
+
+**第一步：检查目标 CUDA 环境**
 
 ```bash
-# 无 CUDA/PyTorch/vLLM 也可查看帮助
-python3 benchmark_w8a8_block_fp8.py --help
-
-# 已观测的每个 TP rank (N,K)：仅 CPU 预览
-python3 benchmark_w8a8_block_fp8.py --shape 768 2048 --batch-size 17 --out-dtype float16 --preview
-
-# 架构预览需要 vLLM 配置加载能力，但不初始化 CUDA
-python3 benchmark_w8a8_block_fp8.py --model Qwen/Qwen3-8B --tp-size 4 --preview
-
-# CUDA/import/symbol/signature/device 检查，失败返回非零
 bash scripts/environment_check.sh
-
-# 小规模真实调优：包含默认配置对照、finalist 复测和 correctness
-python3 benchmark_w8a8_block_fp8.py --shape 128 256 --batch-size 17 --out-dtype float16 --save-path ./tuned_configs
-
-# Qwen3 的普通 linear；先确认真实 FP8 checkpoint/backend
-bash scripts/tune_qwen3.sh Qwen/Qwen3-8B 4 128 128
 ```
 
-微基准直接生成合成的已量化 FP8 A/B 和 scales，不包含激活量化、模型加载、attention 或 serving 开销。使用未量化模型标识的示例只推导其 linear 维度，不会把 checkpoint 转换为 FP8。
+该命令检查必要模块、内核参数签名、设备名称接口和 GPU 计算能力。如果返回非零退出码，说明当前环境尚不能进行正式调优。
 
-## 参数与语义
-
-| 参数 | 含义 / 默认值 |
-| --- | --- |
-| `--model` | 显式 adapter 支持的模型标识/本地配置；与 `--shape` 互斥 |
-| `--shape N K` | 可重复指定已观测的**每个 rank**普通 linear 权重尺寸；已做 TP 切分，不再除以 TP |
-| `--tp-size`, `-tp` | 目标 vLLM tensor-parallel world size，默认 `1`；不是调优 GPU 数量 |
-| `--batch-size` | 单个 GEMM M / flattened token rows；省略则为 `1,2,4,8,16,24,32,48,64,96,128,256,512,1024,1536,2048,3072,4096` |
-| `--block-n`, `--block-k` | checkpoint/runtime 的量化布局，默认 `128,128`；不小于 32 的 2 的幂，不是任意调优 tile |
-| `--out-dtype` | 默认 `auto`（仅 model 模式），另有 `float16`、`half` 别名、`bfloat16`、`float32`；显式值须匹配 serving 启动参数 |
-| `--input-type` | 只允许 `fp8` |
-| `--save-path` | 默认当前目录下 `./tuned_configs`；单模型 Shell wrapper 默认仓库根目录 `tuned_configs/` |
-| `--overwrite` | 显式替换重叠 M；保留其他已有 M |
-| `--trust-remote-code` | 默认关闭；显式授权执行模型仓库代码 |
-| `--preview` | 输出 shape、来源层、M、TP、布局及 requested/resolved/source dtype，不执行 CUDA |
-| `--check-environment` | 检查 CUDA 依赖/设备及实际需要的 FP8 symbol/helper/signature |
-| `--verify-installed` | 比较保存文件与已安装 loader 结果并运行其公开 Triton wrapper；不验证 serving backend 选择 |
-| `--seed` | 非负合成输入种子，默认 `0` |
-| `--measurements` | CUDA event 测量轮数，默认 `5` |
-| `--calls-per-event` | 每个 event 内实际 kernel 调用数，默认 `1`；显式 >1 测量 repeated-call 平均值 |
-
-M 是 GEMM 的 M 维度，不一定等于并发 serving request 数。TP 改变目标模型切分尺寸；调优 worker 数独立取 `min(可见 CUDA GPU 数, 请求 M 数)`。只有一个 M 时没有可并行的 M 任务，因此使用一个 GPU。以 M 为成本 proxy，用 deterministic LPT/greedy 分配，各 worker 内 M 按升序记录。参与 GPU 必须同型号。重复 shape 只调一次；worker 空任务、缺失、重复或意外结果都会在保存前中止。
-
-QKV 使用 `local_q = Q_heads / TP`、`local_kv = max(1, KV_heads / TP)`，`N = (local_q + 2*local_kv)*head_dim`、`K = hidden_size`。Attention output 的 `K = local_q*head_dim`，不必等于 `hidden_size/TP`。严格验证 Q/KV 分片或复制关系。普通融合 gate/up 使用 `N = 2*intermediate_size/TP`，仅在对应架构实际构造该 MLP 时生成。不会从 `moe_intermediate_size` 推测 routed expert 尺寸。也会检查 runtime K 分组和 fused partition block 对齐。自动 adapter 当前要求方形 FP8 block：核对的 `Fp8Config` 用 block N 生成激活分组，而目标 GEMM 预期 block K。非方形布局必须使用显式观测的 `--shape`，并确认真实调用方提供正确 scales。
-
-Model auto output dtype 调用已安装 vLLM 的 `_get_and_verify_dtype`，传入 `dtype="auto"`，复用其 HF config conversion、下转和有效性规则。Qwen3 BF16 checkpoint 解析为 BF16；显式 override 被尊重，`half` 规范化为 `float16`。Resolver API/结果不支持时明确失败并提示 `--out-dtype`，不回退 FP16；helper 不建立 engine、不加载权重。Auto API 源码契约核对于 vLLM `32fbfa15e8bacc64182cb1286831bd63d7e4fc12`，并非已安装 runtime 验收。`--shape` 没有模型 dtype 信息，**必须显式指定 `--out-dtype`**，预览也一样。Plan/report 同时记录 `requested_out_dtype`、`resolved_out_dtype`、规范化的 `out_dtype` 和 `out_dtype_source`（`vllm-model-auto` 或 `explicit`），执行只使用 resolved 值。
-
-Wrapper 接受 `MODEL TP BLOCK_N BLOCK_K`，四个位置参数后可跟额外 CLI flag。支持环境变量 `PYTHON`、`SAVE_PATH`、`OUT_DTYPE`、`INPUT_TYPE`、`BATCH_SIZE` 和显式 `TRUST_REMOTE_CODE=1`。只有显式设置 `OUT_DTYPE` 才传 `--out-dtype`，否则保留 model auto；所有 wrapper 默认关闭 remote code。例如预览：
+**第二步：预览一个已知 GEMM 形状**
 
 ```bash
-bash scripts/tune_custom.sh Qwen/Qwen3-8B 4 128 128 --preview
+python3 benchmark_w8a8_block_fp8.py \
+  --shape 128 256 \
+  --out-dtype bfloat16 \
+  --batch-size 17 \
+  --preview
 ```
 
-批量示例 `examples/tune_qwen3_models.sh` 将模型/TP 任务隔离到 `tuned_configs/batch/<模型名中的斜杠替换为下划线>/tp_<TP>/`。在此 batch runner 中，`SAVE_PATH` 或 `--save-path` 指定的是**根目录**，CLI 优先。例如 Qwen3-8B TP=4 输出到 `tuned_configs/batch/Qwen_Qwen3-8B/tp_4/`。重跑同一任务仍需显式 `--overwrite`。安装时从目标任务目录复制配置，不要从 batch 根目录复制。
+这里 `(N, K) = (128, 256)` 表示权重的两个维度，`M = 17` 表示一次 GEMM 处理的扁平化输入行数。`--preview` 只输出任务计划，**不会**编译或测量 GPU 内核。
 
-## 测量与保存
+**第三步：真正调优这个形状**
 
-每个候选先编译并预热五次，再以预分配输出 buffer 进行多轮 eager CUDA event 测量。默认每个 event 仅执行一次 GEMM，直接换算微秒，不额外除以调用数。显式 `--calls-per-event >1` 测量 repeated-call 平均值，换算为 `elapsed_ms * 1000 / calls_per_event`。重复调用会改变 workload/cache 行为，可能改变配置排名，不能与单次调用 latency 混为一谈。搜索按中位数排序；成功候选中的前三名，以及源码核对的默认配置（可运行时），在同一批 tensor 上独立复测，并与同一 A/B/scales 反量化后的 FP32 matmul 比较（`rtol=0.02`、`atol=0.02`，要求有限值）。复测中位数最低者胜出，默认配置也可能胜出。默认配置出现 `OutOfResources` 时不再重试，报告记录 `baseline.status=unavailable` 及原因；可运行的默认配置记录 `baseline.status=validated` 和独立复测结果。仅跳过 Triton `OutOfResources` 候选；未知编译/runtime/数值错误直接失败。这是 sanity check，不证明模型精度或全局最优。
+```bash
+python3 benchmark_w8a8_block_fp8.py \
+  --shape 128 256 \
+  --out-dtype bfloat16 \
+  --batch-size 17 \
+  --save-path ./tuned_configs/quickstart
+```
 
-成功运行另存 `reports/<UTC timestamp>-<id>.json`，记录 seed、软件/kernel 源码 hash、设备、shape/来源层、输出 dtype、量化布局、finalist 样本和误差、默认配置对照、资源不足计数。官方 config 只存 M 到 launch config 的映射。
+即使只指定一个形状、一个 `M`，工具仍会搜索数量较多的启动参数组合。因此先从这个受限任务入手，再考虑完整的 M 网格。仅当调优和校验成功后，才会生成 vLLM JSON 与独立报告。**生成文件不等于已经安装到 vLLM。**
 
-文件名调用**已安装 vLLM 的设备名 helper**，格式严格为：
+### 根据 Qwen3 模型自动确定形状
+
+例如预览官方 Qwen3-Coder FP8 在目标 TP=4 下的普通线性层形状：
+
+```bash
+python3 benchmark_w8a8_block_fp8.py \
+  --model Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 \
+  --tp-size 4 \
+  --preview
+```
+
+工具仅加载模型配置，不加载权重。模型模式默认使用 `--out-dtype auto`：由**当前安装的 vLLM dtype resolver** 决定输出类型。在支持 BF16 的目标 CUDA 环境中，这个 BF16 模型预期解析为 `bfloat16`；用户显式指定的 `--out-dtype` 始终优先。
+
+确认计划及目标 Backend 后，可以通过便捷脚本只调一个 `M`：
+
+```bash
+BATCH_SIZE=17 bash scripts/tune_qwen3_coder.sh
+```
+
+该脚本默认选择 Qwen3-Coder FP8、目标 TP=4、128×128 FP8 Block。`BATCH_SIZE` 只限制这次搜索的 `M`；不设置时将使用默认的完整 M 网格。针对其他受支持的配置，还可使用 `scripts/tune_qwen3.sh` 和 `scripts/tune_custom.sh`。
+
+**自动推导形状不是量化转换。** 例如 `--model Qwen/Qwen3-8B` 可以分析未量化模型的普通线性层维度，但不会把它变成 FP8 Checkpoint，也不能证明部署时正在使用本 Triton Kernel。
+
+## 选择正确的调优模式
+
+| | `--model MODEL` | `--shape N K` |
+| --- | --- | --- |
+| `(N, K)` 的来源 | 受支持的 Qwen3 模型配置 + 目标 `--tp-size` | 已实际观测的单个目标 TP rank 形状 |
+| 输出 dtype | 默认 `auto`，交给安装版本的 vLLM 解析 | **必须明确指定** `float16`、`bfloat16` 或 `float32` |
+| FP8 布局责任 | 校验可识别的 checkpoint metadata 与自动 Adapter 的 Block/对齐限制 | 用户必须确认真实 Runtime 使用相同量化布局和 Triton 内核 |
+| 适用场景 | 受支持 Qwen3 的普通线性层 | 未支持的架构或已有真实维度的特定 GEMM |
+
+这里有两个容易混淆的参数：
+
+- **`M` 是 GEMM 输入的扁平化 Token 行数**，不一定等于推理服务的并发请求数。
+- **`--tp-size` 是模型目标 Tensor Parallel 的分片数量**，不是用于调优的 GPU 数量。调优 GPU 数由可用设备和待调 M 数量决定。
+
+模型模式的 `auto` dtype **与运行平台有关**：如果在纯 CPU 环境预览，vLLM 可能解析出不同于目标 NVIDIA CUDA 环境的 dtype。因此必须在最终调优设备上确认；显式形状模式无法推断模型 dtype，未填写 `--out-dtype` 将直接报错，而不会擅自选用 FP16。
+
+自动 Adapter 有意保持保守：它会检查 Q/KV 分片或复制、融合投影宽度、dense/shared MLP 是否真的存在，以及 FP8 Block 对齐条件。无法识别的架构、影响目标投影的量化排除项或不匹配的布局会直接拒绝，而不是猜出一个看似合理的 Shape。自动 Adapter 当前仅支持**方形 FP8 Block**；使用显式形状也不意味着可以忽略真实 Runtime 的 Scale/Layout 约束。
+
+## 输出文件与配置复用
+
+调优成功后，输出目录示意如下：
 
 ```text
-N={N},K={K},device_name={normalized device},dtype=fp8_w8a8,block_shape=[{block_n},{block_k}].json
+tuned_configs/quickstart/
+├── N=128,K=256,device_name=GPU_NAME,dtype=fp8_w8a8,block_shape=[128,128].json
+├── N=128,K=256,device_name=GPU_NAME,dtype=fp8_w8a8,block_shape=[128,128].json.lock
+└── reports/
+    └── <UTC时间>-<运行ID>.json
 ```
 
-每个文件从读取到合并/保存均持有文件锁；先写同目录临时 JSON，再 flush/fsync/close，最后 atomic replace。默认合并不重叠的 M；重叠 M 在调优前拒绝。`--overwrite` 仅替换请求的 M。已有 JSON 损坏或不兼容时，即使指定 `--overwrite` 也拒绝。不静默把完整文件缩成单个 M。`.lock` 文件是正常产物，安装时只复制顶层 `.json`。原子性按文件提供，不是跨所有 shape 的事务；后续文件写失败时，先前完整文件可能已保留，但不会输出成功。文件系统须支持 advisory lock 和 atomic replace。
+根目录下的 `.json` 是 **vLLM Loader 使用的配置**：以 `M` 为键，映射到 Triton 启动参数。`reports/` 中的文件记录模型/形状计划、时间、数值误差、随机种子、GPU 和软件/Kernel 身份。`.lock` 只用于文件写入协调，**不需要安装到 vLLM**。
 
-官方文件名不区分输出 dtype、TP、模型或 vLLM 版本。不同软件/kernel 身份或输出 dtype 应使用不同 `--save-path`；仅合并针对相同 runtime/layout 的运行。同名不能证明对不同 vLLM kernel 仍有性能兼容性。
+- 再次调优时，如果新旧 `M` **互不重叠**，工具会保留此前已经保存的值并追加新条目。
+- 如果某个 `M` 已存在，默认报错；显式 `--overwrite` **只替换本次指定的重叠 `M`**，不会丢弃其他条目。
+- 参与调优的 GPU 必须是相同型号。不同 `M` 采用确定性的负载均衡策略分配，主进程在写入前检查是否存在遗漏、重复和意外结果。
+- 单个 JSON 的更新使用文件锁与原子替换；**多个形状之间不是事务**。后续文件保存失败时，已成功写入的文件可能保留，但整次任务不会报告成功。
 
-## 在目标 CUDA 主机安装与验证
+**务必按运行环境隔离配置。** vLLM 官方文件名包含 `(N, K)`、GPU 名称、FP8 类型与 Block 大小，却**不包含**模型、TP、输出 dtype 或 vLLM/Kernel 版本。不同输出类型、内核版本或其他不兼容的调优环境应使用不同的 `--save-path`。当前工具不会根据历史 Provenance 自动阻止两个同名文件的跨运行合并。
 
-使用实际命令输出的目录。单模型 wrapper 默认仓库根目录 `tuned_configs/`。使用 Python 默认目录时，在仓库根目录执行：
+### 安全安装与验证
+
+生成的 JSON 只有放入安装版本的 vLLM 配置目录后，才有机会被对应 Loader 消费。**优先在独立虚拟环境或容器中验收**：覆盖配置可能改变该环境内服务进程使用的内核参数，不能未经备份就覆盖已有文件。
+
+下面的命令只安装**一份此前不存在的同名配置**；如果检测到同名文件，会拒绝覆盖：
 
 ```bash
 CONFIG_DIR=$(python3 -c 'from pathlib import Path; from vllm.model_executor.layers.quantization.utils import fp8_utils; print(Path(fp8_utils.__file__).resolve().parent / "configs")')
-cp ./tuned_configs/*.json "$CONFIG_DIR/"
+SOURCE=$(find ./tuned_configs/quickstart -maxdepth 1 -type f -name 'N=*.json' -print -quit)
 
-# 新进程：真实已安装 loader、请求 M 覆盖以及公开 Triton wrapper
-python3 benchmark_w8a8_block_fp8.py --shape 128 256 --batch-size 17 --out-dtype float16 \
-  --save-path ./tuned_configs --verify-installed
+if [ -z "$SOURCE" ]; then
+  echo "没有找到生成的配置文件" >&2
+else
+  mkdir -p "$CONFIG_DIR"
+  TARGET="$CONFIG_DIR/$(basename "$SOURCE")"
+  if [ -e "$TARGET" ]; then
+    echo "拒绝覆盖已有配置：$TARGET" >&2
+    echo "请先备份，再由你明确决定是否替换。" >&2
+  else
+    cp "$SOURCE" "$TARGET"
+    echo "已安装：$TARGET"
+  fi
+fi
 ```
 
-只有 N、K、规范化 device name、`fp8_w8a8`、block shape 与 loader 的真实调用匹配，且 serving 选中普通 linear Triton backend 时，配置才生效。Loader 选择最接近的已保存 M；报告仅记录真实测量的 M。安装后应重启 serving，因为 loader 缓存配置。Backend 可能选 CUTLASS/DeepGEMM/FlashInfer 等其他内核；复制 JSON 不能证明被使用。应在选定 vLLM build 上核验 backend 和真实模型调用，再以相同条件比较 serving 性能。本仓库目前不声明端到端 serving 性能收益。
+如果目标位置**原本就有文件**，应先备份，再明确决定是否替换。以下命令仅适用于这一情况，且需先执行上方代码以获得 `SOURCE` 和 `TARGET`：
 
-源码契约于 2026-10-08 对照 vLLM main commit [`c741bfca70cfb777e2016f827eae31f6e215fe9f`](https://github.com/vllm-project/vllm/tree/c741bfca70cfb777e2016f827eae31f6e215fe9f)。这是源码兼容性参考，**不是** GPU 实测版本保证。[验证记录](docs/VALIDATION.md)包含固定 kernel/adapter/loader 来源和剩余硬件验收项。
+```bash
+BACKUP_DIR=$(mktemp -d "$PWD/tuned_configs/install-backup.XXXXXX")
+cp -p "$TARGET" "$BACKUP_DIR/"
+echo "原配置已备份到：$BACKUP_DIR"
+cp -i "$SOURCE" "$TARGET"   # 仅在确认提示后替换。
 
-真实 CUDA 验收是独立于 CPU CI 的**合并 gate**；硬件 gate 未满足前 PR 保持 Draft。完整 preflight、小 shape 调优、installed-loader/public-wrapper、官方模型 preview 以及 1/10 calls 对照命令见 [CUDA 验收步骤](docs/CUDA_VALIDATION.md)。
+# 验收结束后，恢复原文件：
+cp -p "$BACKUP_DIR/$(basename "$TARGET")" "$TARGET"
+```
 
-## 测试与旧入口迁移
+如果该文件**在安装前不存在**，回滚时只删除本次新增的文件（`rm -- "$TARGET"`）。对于多个 Shape，应逐个检查和安装，不要把整个输出目录或 `reports/` 批量复制进去。安装和回滚后都应重新启动受影响的服务进程；修改 vLLM 安装目录可能需要相应的文件写入权限。
+
+完成安装后，使用**新的 Python 进程**，并保持与生成配置时相同的 Shape、`M`、Block 布局和输出 dtype：
+
+```bash
+python3 benchmark_w8a8_block_fp8.py \
+  --shape 128 256 \
+  --out-dtype bfloat16 \
+  --batch-size 17 \
+  --save-path ./tuned_configs/quickstart \
+  --verify-installed
+```
+
+这个检查会比较已安装 Loader 返回的配置，并调用公开 Triton wrapper 进行数值检查。但它**不能证明完整推理服务选择了 `TritonFp8BlockScaledMMKernel`**：服务端也可能使用 CUTLASS、DeepGEMM 或 FlashInfer。还需要单独确认真实模型的 Backend 选择和性能。Loader 有配置缓存，因此有意安装或回滚后，应重新启动相关服务进程。
+
+完整的硬件验收步骤（包括 FP16/BF16 Smoke、模型配置预览，以及单次与连续多次调用的对照）参见 [CUDA 验收文档](docs/CUDA_VALIDATION.md)。
+
+## 调优与正确性判断方式
+
+本工具直接调用**已安装 vLLM 的私有 Triton 内核**，不会复制一份旧 Kernel 作为备用实现。每组 `(M, N, K)` 的流程是：
+
+1. 生成合成的 FP8 E4M3FN 激活和权重，以及 FP32 Scale；同一 Shape 的候选配置使用同一批输入。
+2. 对候选配置预热并使用 CUDA Event 测时。默认**每个 Event 调用一次 GEMM**；显式设置 `--calls-per-event >1` 才测量连续多次调用的平均值。这种负载可能具有不同的缓存行为和排名。
+3. 根据测量中位数筛选前三名，并在默认配置能够运行时加入对照；对这些候选进行独立复测。
+4. 使用**相同 FP8 数据与 Scale** 反量化后的 FP32 矩阵乘法作为参考进行数值校验（`rtol=0.02`、`atol=0.02`），拒绝 NaN/Inf。
+5. 保存复测中最快、且数值通过的候选和测量报告。可识别的 Triton 资源不足候选会跳过；其他编译、运行和数值错误不会被静默吞掉。
+
+这证明的是有限条件下的**内核数值合理性与调优结果**，不是端到端模型精度、生产输入分布代表性、全局最优配置或真实服务吞吐提升。只有部署时实际选中了对应 Triton 路径，调优结果才有可能发挥作用。
+
+## 常用参数
+
+| 参数 | 含义 |
+| --- | --- |
+| `--model MODEL` / `--shape N K` | 互斥的形状来源；`--shape` 可以重复 |
+| `--tp-size TP` | 模型目标 TP，默认 `1` |
+| `--out-dtype auto\|float16\|bfloat16\|float32\|half` | 模型模式默认 `auto`；显式 Shape 模式必填；`half` 等价于 `float16` |
+| `--block-n N`、`--block-k K` | FP8 量化 Block 大小，默认均为 `128` |
+| `--batch-size M` | 只调一个 `M`；省略则搜索默认 18 个 M 点 |
+| `--save-path DIR` | 输出 JSON 和报告，默认 `./tuned_configs` |
+| `--overwrite` | 允许替换本次重叠的 `M`，不影响其他 M |
+| `--preview` | 仅展示计划，不执行 GPU 内核 |
+| `--check-environment` | 检查 CUDA/vLLM/Triton 接口与设备能力 |
+| `--verify-installed` | 比较 Loader 配置并调用公开 wrapper 检查 |
+| `--measurements N`、`--calls-per-event N` | CUDA Event 轮数（默认 `5`）和每轮调用数（默认 `1`） |
+| `--trust-remote-code` | 显式允许模型仓库代码执行；**默认关闭** |
+
+Shell Wrapper 另支持 `BATCH_SIZE`、`OUT_DTYPE`、`SAVE_PATH`、`PYTHON`、`TRUST_REMOTE_CODE=1` 等环境变量。批量任务中的 `SAVE_PATH` 或 `--save-path` 指定的是**批量根目录**；不同模型和 TP 会自动隔离到子目录。参见 [`examples/tune_qwen3_models.sh`](examples/tune_qwen3_models.sh)。
+
+## 测试与常见问题
 
 ```bash
 python3 -m pytest -q
-# 可选真实 CUDA：编译/调优、3种输出 dtype、M=1/17/64、N尾块、官方 loader/wrapper
+# 具备兼容 CUDA GPU 的机器还应执行：
 python3 -m pytest -q tests/test_gpu.py
 ```
 
-可选 GPU 套件在临时目录隔离已安装 loader 的配置路径，不修改已安装 vLLM 源码。本机为 **Not executed — CUDA GPU unavailable**（同时未安装 PyTorch/vLLM）。CPU unit/源码契约及 Shell 子进程结果见 [docs/VALIDATION.md](docs/VALIDATION.md)，不编造 GPU 提速数据。
+已审查 PR 的 Python 3.10/3.13 CPU/Shell 检查通过，但缺少 CUDA/vLLM 的机器上 GPU 模块会跳过。**GPU 测试被跳过不等于硬件验收通过。** 详细证据参见 [验证记录](docs/VALIDATION.md)。
 
-`benchmark_w8a8_block_fp8_qwencoder.py` 改为 deprecated 薄 wrapper，要求与主入口相同的显式来源参数。`scripts/tune_deepseek_v3.sh` 现在非零退出并提示改用观测的 `--shape N K --out-dtype float16`（或实际目标 dtype）。旧 `...qwen3_30b.py` 和 `...qwen3omni_talker.py` 实际运行 INT8 W8A8，与文件名不符；保留历史标记，不重定向成 FP8。[README_AWQ.md](README_AWQ.md) 是历史文档，其自定义 JSON 在核对的 vLLM AWQ runtime 中没有自动消费者。
+| 遇到的问题 | 建议检查 |
+| --- | --- |
+| `--shape` 提示缺少 `--out-dtype` | 明确指定目标服务实际采用的输出 dtype；仅凭矩阵维度无法推断。 |
+| 模型架构或排除项被拒绝 | Adapter 无法证明目标普通 FP8 Linear 确实存在。确认真实 Backend/Layout 后，再使用已观测的单 rank `--shape`。 |
+| 已存在同一个 `M` | 换输出目录、调不同的 `M`，或明确使用 `--overwrite`。 |
+| 内核/helper/signature 检查失败 | 安装的 vLLM 可能与本工具不兼容；应确认目标版本，而非静默换用另一个 Kernel。 |
+| JSON 安装后服务没有变化 | 核对完整文件名、M 选择、安装目录、进程是否重启，以及服务是否真的选择 Triton 后端。 |
 
-## 仓库结构
+## 项目状态与许可
 
-```text
-benchmark_w8a8_block_fp8.py                # 正式 CUDA tuner/CLI
-fp8_tuning.py                             # CPU shape/合并/保存 helper
-benchmark_w8a8_block_fp8_qwencoder.py       # Deprecated FP8 薄 wrapper
-benchmark_w8a8_block_int8.py                # 历史，非维护
-benchmark_awq_w4a16.py                     # 历史，非维护
-benchmark_w8a8_block_fp8_qwen3_30b.py        # 历史 INT8，文件名有误导
-benchmark_w8a8_block_fp8_qwen3omni_talker.py # 历史 INT8，文件名有误导
-scripts/                                  # 维护入口/环境检查，及 DeepSeek 停用提示
-examples/tune_qwen3_models.sh              # 批量 runner，任一失败最终非零
-tests/                                   # CPU、Shell、源码契约、可选 GPU 测试
-docs/VALIDATION.md                        # 修复证据与第二轮自查
-.github/workflows/tests.yml               # CPU/Shell CI
-README.md / README_zh.md / README_AWQ.md
-LICENSE / NOTICE
-```
+目前正式维护的是 **CUDA W8A8 Block FP8** 主路径。INT8、AWQ 和旧的模型专用脚本只作为**历史/实验性、当前不维护**的代码保留，不保证其 Runtime 兼容性或配置能够被自动消费。[`README_AWQ.md`](README_AWQ.md) 是历史资料，不代表 AWQ 已完成集成。
 
-完整 Apache License 2.0 文本见 [LICENSE](LICENSE)；版权与来源说明保留于 [NOTICE](NOTICE) 和 SPDX 文件头。
+仓库曾针对一个固定的 vLLM 上游版本核对源码契约；这既不代表与所有版本兼容，也不能替代 CUDA 实测。固定版本和待验收事项参见 [验证记录](docs/VALIDATION.md)。
+
+本项目遵循 [Apache License 2.0](LICENSE)。代码来源与版权说明见 [NOTICE](NOTICE) 及各源码文件头。

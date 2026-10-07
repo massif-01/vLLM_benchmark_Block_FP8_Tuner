@@ -40,12 +40,42 @@ Require compilation/search, finalist correctness, winner, JSON and report succes
 
 ## 3. Installed loader / public wrapper
 
-Install only the single-call smoke's top-level official JSON, then verify in a **new process**:
+Use a disposable vLLM environment. Install only the single-call smoke's top-level official JSON, refusing to replace an existing file:
 
 ```bash
 CONFIG_DIR=$(python3 -c 'from pathlib import Path; from vllm.model_executor.layers.quantization.utils import fp8_utils; print(Path(fp8_utils.__file__).resolve().parent / "configs")')
-cp ./tuned_configs/smoke/calls_1/*.json "$CONFIG_DIR/"
+SOURCE=$(find ./tuned_configs/smoke/calls_1 -maxdepth 1 -type f -name 'N=*.json' -print -quit)
 
+if [ -z "$SOURCE" ]; then
+  echo "No generated config found" >&2
+else
+  mkdir -p "$CONFIG_DIR"
+  TARGET="$CONFIG_DIR/$(basename "$SOURCE")"
+  if [ -e "$TARGET" ]; then
+    echo "Refusing to replace existing config: $TARGET" >&2
+    echo "Back it up and explicitly approve replacement first." >&2
+  else
+    cp "$SOURCE" "$TARGET"
+    echo "Installed: $TARGET"
+  fi
+fi
+```
+
+If the target already exists, back it up before explicitly approving replacement. Run the following only for that case, with `SOURCE` and `TARGET` set above; stop if the backup fails:
+
+```bash
+BACKUP_DIR=$(mktemp -d "$PWD/tuned_configs/install-backup.XXXXXX")
+cp -p "$TARGET" "$BACKUP_DIR/" && cp -i "$SOURCE" "$TARGET"
+
+# After validation, restore the original file:
+cp -p "$BACKUP_DIR/$(basename "$TARGET")" "$TARGET"
+```
+
+If the target did not exist before installation, rollback means removing only the added file (`rm -- "$TARGET"`). Do not install `.lock` files or `reports/`. Restart affected serving processes after installation or rollback. See the [README installation procedure](../README.md#inspect-install-and-verify-safely) for the same safeguards.
+
+Only after successful installation, verify in a **new process** with the same shape, M, layout and output dtype:
+
+```bash
 python3 benchmark_w8a8_block_fp8.py \
   --shape 128 256 --batch-size 17 --out-dtype float16 \
   --seed 0 --save-path ./tuned_configs/smoke/calls_1 --verify-installed

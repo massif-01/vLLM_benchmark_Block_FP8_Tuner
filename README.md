@@ -1,151 +1,261 @@
-# CUDA vLLM W8A8 Block FP8 Tuning Tool
+# vLLM Block FP8 Tuner
 
-[English](README.md) | [中文](README_zh.md)
+**CUDA W8A8 Block FP8 · Triton kernel tuning for regular linear layers**
 
-A **CUDA-only vLLM W8A8 Block FP8 Triton kernel tuning tool**. The maintained entry is `benchmark_w8a8_block_fp8.py`. It tunes ordinary two-dimensional linear GEMMs, checks numerical correctness of finalists, merges all requested M values, and writes vLLM-compatible configs safely. It does not promise a speedup or tune an entire model.
+[English](README.md) · [简体中文](README_zh.md)
 
-## Scope and evidence
+Find launch configurations for vLLM's W8A8 block-FP8 Triton matrix-multiplication kernel, validate the selected results numerically, and export them in the JSON format read by vLLM. Tuning work can be distributed across multiple NVIDIA GPUs without workers overwriting each other's results.
 
-| Capability | Current scope / validation |
+This is an **independent tuning utility**, not an official vLLM component. It measures isolated GEMMs—not full-model inference—and does not guarantee a serving speedup.
+
+> **Validation status:** CPU, CLI, and shell regression checks have passed on the reviewed PR. Real CUDA compilation, numerical tuning, installed-loader integration, and serving performance are **not yet verified**. Do not treat generated configurations as production-validated until the [CUDA acceptance procedure](docs/CUDA_VALIDATION.md) has passed on your target system.
+
+## What it does
+
+```text
+Model config ──→ supported Qwen3 per-rank linear shapes ──┐
+                                                        ├─→ tune (M, N, K)
+Observed per-rank (N, K) ────────────────────────────────┘       │
+                                                              ▼
+                                             benchmark Triton launch candidates
+                                                              │
+                                                              ▼
+                                            remeasure + numerical correctness
+                                                              │
+                                                              ▼
+                                         merge results from all GPU workers
+                                                              │
+                                                              ▼
+                                            write vLLM-compatible config JSON
+```
+
+- **Model-aware planning.** Derives actual tensor-parallel shapes for `Qwen3ForCausalLM` and `Qwen3MoeForCausalLM`, including grouped-query attention and the regular dense/shared MLPs that are present.
+- **Manual shape mode.** Tunes explicitly observed per-rank `(N, K)` dimensions when automatic planning is not appropriate.
+- **Multi-GPU tuning.** Distributes the requested `M` values across matching GPUs, merges results in the parent process, and checks every expected shape and `M` before saving.
+- **Configuration protection.** Merges disjoint `M` entries, refuses overlapping entries by default, and uses a file lock plus atomic replacement when updating each JSON file.
+- **Measured, not assumed.** Compares shortlisted kernels with an FP32 dequantized reference computed from the same quantized inputs; records timing, correctness, and software/kernel identity separately from the loader config.
+
+### Scope
+
+| Supported | Outside the maintained scope |
 | --- | --- |
-| Device | NVIDIA CUDA, native FP8 compute capability >= 8.9; CUDA PyTorch, vLLM and Triton required |
-| Kernel | Installed vLLM `_w8a8_triton_block_scaled_mm`; FP8 E4M3FN A/B, FP32 scales; FP16, BF16 or FP32 output |
-| Automatic dense adapter | `Qwen3ForCausalLM`: GQA QKV, attention output, fused gate/up, down projection |
-| Partial MoE adapter | `Qwen3MoeForCausalLM`: attention plus regular dense/shared MLPs that actually exist according to the layer schedule |
-| Excluded | Routed experts / fused MoE, LM head, router and shared-expert gate, Next/VL/Omni/nested configs, DeepSeek auto-detection, unknown architectures |
-| Evidence | CPU shape/persistence/entry-point and source-contract tests pass. GPU compilation, numerical/performance and serving verification remain **unverified** on this machine |
+| NVIDIA CUDA GPUs with compute capability **8.9 or newer** | Earlier GPUs, ROCm, XPU, or CPU tuning |
+| Installed vLLM W8A8 block-FP8 **Triton regular-linear** kernel | Routed/fused MoE expert kernel tuning |
+| Explicit Qwen3 dense and Qwen3-MoE *regular-linear* shape adapters | Generic architecture guessing; Qwen3-Next/VL/Omni and DeepSeek automatic planning |
+| FP8 E4M3FN inputs and FP32 scales; FP16, BF16, or FP32 outputs | INT8 and AWQ development (historical scripts remain unmaintained) |
 
-Auto shape detection is architecture-aware and only enabled for explicitly supported architectures. Unsupported architectures fail instead of falling back to unrelated shapes. Names containing “Qwen” are not used to select an adapter. MoE model support does not mean routed expert kernel tuning.
+**Important:** A Qwen3-MoE adapter does **not** tune routed experts. Nor does finding a linear shape prove that the running model uses block-FP8 or selects the Triton backend. Runtime backend selection must be verified separately.
 
-Shape adapters establish the dimensions of regular linears; they do not prove that every layer is quantized or that a serving engine selects this Triton backend. If checkpoint quantization metadata exists, auto-detection accepts only dynamic `fp8` with matching `weight_block_size`. Both `ignored_layers` and `modules_to_not_convert` are checked together. Explicit non-target exclusions (LM head, embeddings, layernorms, Q/K norms, MoE router `mlp.gate`, shared-expert gate, routed-expert subtree and bias parameters) are allowed. Target projections in checkpoint or fused runtime names, broad parent scopes and unrecognized patterns fail closed with the offending exclusion and `--shape N K` guidance. The planner can conservatively classify simple `*` component patterns when inspecting metadata. This is this tool's safety-analysis convention, not a claim that installed vLLM interprets those strings as globs; its regular FP8 path uses exact matching. The classifier does not implement a runtime glob/regex engine. Without metadata, the preview/report states that FP8 and backend selection still need runtime confirmation. Other quantization formats can use explicitly observed shapes only when they really reach the same kernel/layout.
+## Requirements
 
-Repository still contains historical/experimental INT8 and AWQ scripts, but they are **not part of the currently maintained and validated workflow**. They are not recommended entry points; their compatibility, correctness and runtime consumption are not maintained. No ROCm/XPU support is provided.
+- A Python environment with **CUDA-enabled PyTorch, Triton, and a compatible vLLM installation**. Follow the requirements of your installed vLLM release; this repository does not provide a substitute kernel or a separate dependency compatibility matrix.
+- An NVIDIA GPU with **SM 8.9+** for actual tuning. For example, RTX 4090 (SM 8.9) and H100 (SM 9.0) meet this requirement; RTX A6000 (SM 8.6) and Jetson AGX Orin (SM 8.7) do not.
+- The installed vLLM private FP8 kernel, configuration loader, and device-name helper must match the contracts checked by the tuner. Run preflight after every relevant vLLM upgrade.
+
+The CPU-only `--help` and explicit-shape `--preview` commands do not require CUDA, PyTorch, or vLLM. Model-aware preview requires vLLM's model-config loader and dtype resolver, but does not load model weights or initialize a tuning GPU.
 
 ## Quick start
 
-Use a CUDA environment compatible with your installed vLLM. CPU planning/tests use Python 3.10+; GPU Python, PyTorch and Triton requirements follow that vLLM build. No kernel implementation is bundled as an import fallback.
+Run these commands from the repository root.
+
+**1. Check the target CUDA environment**
 
 ```bash
-# Inspect CLI without CUDA/PyTorch/vLLM
-python3 benchmark_w8a8_block_fp8.py --help
-
-# Explicit observed per-rank (N,K): CPU-only preview
-python3 benchmark_w8a8_block_fp8.py --shape 768 2048 --batch-size 17 --out-dtype float16 --preview
-
-# Architecture preview needs vLLM model-config loading, but does not initialize CUDA
-python3 benchmark_w8a8_block_fp8.py --model Qwen/Qwen3-8B --tp-size 4 --preview
-
-# CUDA/import/symbol/signature/device preflight; failure is nonzero
 bash scripts/environment_check.sh
-
-# Small actual tuning, including default comparison, finalist remeasurement and correctness
-python3 benchmark_w8a8_block_fp8.py --shape 128 256 --batch-size 17 --out-dtype float16 --save-path ./tuned_configs
-
-# Ordinary linear shapes in a Qwen3 model; confirm actual FP8 backend/checkpoint first
-bash scripts/tune_qwen3.sh Qwen/Qwen3-8B 4 128 128
 ```
 
-The synthetic microbenchmark directly generates quantized FP8 A/B and scales. It excludes activation quantization, model loading, attention and serving overhead. The example with an unquantized model identifier plans its linear dimensions; it does not convert the checkpoint to FP8.
+This checks the necessary imports, kernel signature, device naming, and GPU capability. A nonzero exit means the environment is not ready for tuning.
 
-## Arguments and semantics
-
-| Argument | Meaning / default |
-| --- | --- |
-| `--model` | Model identifier/local config supported by the explicit adapters; exclusive with `--shape` |
-| `--shape N K` | Repeatable observed **per-rank** regular-linear weight shape, already TP-sharded; no further division |
-| `--tp-size`, `-tp` | Target vLLM tensor-parallel world size, default `1`; not tuning GPU count |
-| `--batch-size` | Single GEMM M (flattened token rows); omitted: `1,2,4,8,16,24,32,48,64,96,128,256,512,1024,1536,2048,3072,4096` |
-| `--block-n`, `--block-k` | Checkpoint/runtime quantization layout, default `128,128`; powers of two >=32, not arbitrary tuning tiles |
-| `--out-dtype` | `auto` (default, model only), `float16`, `half` alias, `bfloat16`, `float32`; explicit values must match serving startup options |
-| `--input-type` | Only `fp8` |
-| `--save-path` | Default `./tuned_configs` relative to current directory; single-model wrappers default to repository `tuned_configs/` |
-| `--overwrite` | Explicitly replace overlapping M values; other existing M values remain |
-| `--trust-remote-code` | Default off; explicitly authorizes executing code from the model repository |
-| `--preview` | Print shapes, layer sources, M, TP, layout and requested/resolved/source dtype without CUDA execution |
-| `--check-environment` | Check CUDA dependencies/devices and the actual required FP8 symbols/helper/signature |
-| `--verify-installed` | Check saved vs installed loader results and run its public Triton wrapper; does not verify serving backend selection |
-| `--seed` | Nonnegative synthetic-input seed, default `0` |
-| `--measurements` | CUDA event measurement rounds, default `5` |
-| `--calls-per-event` | Actual kernel calls per measured event, default `1`; >1 explicitly selects repeated-call averages |
-
-M is the GEMM M dimension, not necessarily the number of concurrent serving requests. TP changes model shape partitions; tuning uses up to `min(visible CUDA GPUs, requested M count)` workers independently of TP. One M uses one GPU because there is no parallel M work. M values are assigned by deterministic LPT/greedy balancing using M as the cost proxy; each worker logs its M values in ascending order. Participating GPUs must be the same model. Duplicate shapes are tuned once. Empty, missing, duplicate or unexpected worker results abort before saving.
-
-QKV uses `local_q = Q_heads / TP`, `local_kv = max(1, KV_heads / TP)`, `N = (local_q + 2*local_kv)*head_dim`, `K = hidden_size`. Attention output has `K = local_q*head_dim`, which need not equal `hidden_size/TP`. Exact Q/KV partition/replication relations are checked. A regular fused gate/up uses `N = 2*intermediate_size/TP`; it is generated only when the architecture actually constructs that MLP. Routed-expert dimensions are never inferred from `moe_intermediate_size`. Runtime K grouping and fused partition block alignment are also checked. Automatic adapters currently require square FP8 blocks: the source-audited `Fp8Config` activation grouping uses block N while the target GEMM expects block K. Non-square layouts require explicitly observed `--shape` inputs and confirmation that the real caller supplies the correct scales.
-
-Model auto output dtype delegates to the installed vLLM `_get_and_verify_dtype` resolver with `dtype="auto"`, including its HF config conversion, downcasting and validity rules. Qwen3 BF16 checkpoints resolve to BF16. Explicit output dtype overrides are respected; `half` resolves to `float16`. Unsupported resolver APIs/results fail with `--out-dtype` guidance, without FP16 fallback. No engine or weights are loaded by this helper. Auto API source contract was checked at vLLM `32fbfa15e8bacc64182cb1286831bd63d7e4fc12`; this is not an installed-runtime test. `--shape` has no model dtype information and **requires explicit `--out-dtype`**, including for previews. Plan/report retain `requested_out_dtype`, `resolved_out_dtype`, canonical `out_dtype` and `out_dtype_source` (`vllm-model-auto` or `explicit`); execution uses only the resolved value.
-
-Wrappers accept `MODEL TP BLOCK_N BLOCK_K` followed by extra CLI flags. `PYTHON`, `SAVE_PATH`, `OUT_DTYPE`, `INPUT_TYPE`, `BATCH_SIZE` and explicit `TRUST_REMOTE_CODE=1` are supported environment overrides. Wrappers pass `--out-dtype` only when `OUT_DTYPE` is explicitly set, so model auto remains the default. All wrappers leave remote code off by default. To preview through a wrapper:
+**2. Preview one known GEMM shape**
 
 ```bash
-bash scripts/tune_custom.sh Qwen/Qwen3-8B 4 128 128 --preview
+python3 benchmark_w8a8_block_fp8.py \
+  --shape 128 256 \
+  --out-dtype bfloat16 \
+  --batch-size 17 \
+  --preview
 ```
 
-The batch example `examples/tune_qwen3_models.sh` isolates each model/TP task under `tuned_configs/batch/<model with slashes replaced by underscores>/tp_<TP>/`. In this batch runner, `SAVE_PATH` or `--save-path` sets the **root**; the CLI option takes precedence. For example, Qwen3-8B TP=4 writes to `tuned_configs/batch/Qwen_Qwen3-8B/tp_4/`. Repeating a task still requires explicit `--overwrite`. Install from the specific task directory you intend to use, rather than the batch root.
+Here the weight is `N × K = 128 × 256`, while `M = 17` is the number of flattened input rows processed by the GEMM. Preview displays the task plan; it does **not** compile or benchmark a kernel.
 
-## Measurement and saving
+**3. Tune that one shape**
 
-Each candidate compiles/warms up with five launches. Multiple eager CUDA event rounds use a preallocated output buffer. Default measurement is one GEMM call per event, converted to microseconds without an extra divisor. Explicit `--calls-per-event >1` measures a repeated-call average: `elapsed_ms * 1000 / calls_per_event`. Repeated calls change the workload/cache behavior and can change configuration rankings; they are not interchangeable with single-call latency. Search ranks medians. The top three successful candidates and the source-audited default (when runnable) are independently remeasured on the same tensors and compared with FP32 dequantized matmul using those exact A/B/scales (`rtol=0.02`, `atol=0.02`, finite outputs required). The best remeasured median wins, so the default can win too. A default that fails with `OutOfResources` is not retried; its report entry is `baseline.status=unavailable` with the reason. A runnable default has `baseline.status=validated` and its independent measurement. Only Triton `OutOfResources` candidates are skipped; unknown compilation/runtime/numerical errors fail the task. This is a sanity check, not proof of model accuracy or globally optimal tuning.
+```bash
+python3 benchmark_w8a8_block_fp8.py \
+  --shape 128 256 \
+  --out-dtype bfloat16 \
+  --batch-size 17 \
+  --save-path ./tuned_configs/quickstart
+```
 
-Successful runs save a separate `reports/<UTC timestamp>-<id>.json` with seed, software/kernel source hash, device, shape/layer sources, output dtype, layout, finalist samples/errors, default comparison, and resource-failure counts. Official configs contain only M-to-launch mappings.
+The tuner searches a substantial grid of launch configurations even for one shape and one `M`; start with this limited workload before attempting a full sweep. It writes a vLLM-format JSON and a separate report only after successful tuning and validation. **Generating a file does not install it into vLLM.**
 
-The filename uses the **installed vLLM device-name helper**, exactly:
+### Tune shapes inferred from a Qwen3 model
+
+Preview the official Qwen3-Coder FP8 model's regular-linear shapes at target tensor-parallel size 4:
+
+```bash
+python3 benchmark_w8a8_block_fp8.py \
+  --model Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 \
+  --tp-size 4 \
+  --preview
+```
+
+The model's configuration is loaded, but its weights are not. `--out-dtype auto` is the default in model mode: the tool delegates dtype selection to the **installed vLLM resolver**. For this BF16 model, the expected dtype on a compatible target CUDA platform is `bfloat16`; an explicitly supplied `--out-dtype` takes precedence.
+
+To run a single-`M` sweep through the convenience wrapper after checking the plan and backend:
+
+```bash
+BATCH_SIZE=17 bash scripts/tune_qwen3_coder.sh
+```
+
+This wrapper defaults to the Qwen3-Coder FP8 model, target TP=4, and 128×128 FP8 blocks. The `BATCH_SIZE` environment variable limits it to one `M`; without it, the tuner uses the full default `M` grid. `scripts/tune_qwen3.sh` and `scripts/tune_custom.sh` are also available for supported configurations.
+
+**Model planning is not quantization conversion.** For example, `--model Qwen/Qwen3-8B` can describe the regular-linear dimensions of an unquantized checkpoint, but does not turn that checkpoint into FP8 or prove that your deployed model uses this kernel.
+
+## Choose the right tuning mode
+
+| | `--model MODEL` | `--shape N K` |
+| --- | --- | --- |
+| Source of `(N, K)` | Supported Qwen3 model configuration and target `--tp-size` | Dimensions already observed for one target TP rank |
+| Output dtype | `auto` by default through the installed vLLM resolver | **Must** be explicit: `float16`, `bfloat16`, or `float32` |
+| FP8 layout | Checks supported checkpoint metadata and the automatic adapter's block/alignment limits | You must confirm that the real runtime uses the same quantization layout and Triton kernel |
+| Best for | Supported Qwen3 regular-linear configurations | Unsupported model architectures or individual known GEMMs |
+
+In either mode, `M` is the flattened token-row count passed to a GEMM—not necessarily the serving request batch size. `--tp-size` describes how a target model's weights are sharded; **it does not set the number of GPUs doing the tuning**.
+
+For model mode, `auto` dtype is **platform-dependent**. A preview run on a CPU-only machine may resolve a different dtype from the intended NVIDIA CUDA runtime; the final dtype must be confirmed on the target CUDA system. For manual shape mode, omitting `--out-dtype` is an error rather than an implicit FP16 choice.
+
+Automatic shape planning is intentionally narrow. It validates Q/KV head partitioning or replication, fused projection widths, the presence of dense/shared MLPs, and applicable FP8 block alignment. Unknown architectures, broad quantization exclusions, or incompatible checkpoint layouts fail with guidance to use observed shapes rather than guessing. The automatic adapters currently require **square FP8 block sizes**; explicit shapes do not waive the requirement to verify the actual runtime layout.
+
+## Output and reuse
+
+A completed run produces files like:
 
 ```text
-N={N},K={K},device_name={normalized device},dtype=fp8_w8a8,block_shape=[{block_n},{block_k}].json
+tuned_configs/quickstart/
+├── N=128,K=256,device_name=GPU_NAME,dtype=fp8_w8a8,block_shape=[128,128].json
+├── N=128,K=256,device_name=GPU_NAME,dtype=fp8_w8a8,block_shape=[128,128].json.lock
+└── reports/
+    └── <UTC-timestamp>-<run-id>.json
 ```
 
-Each config save holds a filesystem lock across reading/merging/writing; JSON is written to a sibling temp file, flushed/fsynced/closed, then atomically replaced. Default: merge disjoint M; reject overlapping M before tuning. `--overwrite` replaces only requested M. Malformed or incompatible existing JSON is rejected even with `--overwrite`. Never silently reduce an existing full file to one M. `.lock` files are intentional; only copy the top-level `.json` configs. Atomicity is per file, not a transaction over all shapes; a later write failure may leave earlier complete files, with no success message. Filesystems must support advisory locking and atomic replacement.
+The top-level `.json` is the **vLLM loader config**: a mapping from integer-valued `M` keys to Triton launch parameters. The separate report contains the plan, measurements, correctness results, seed, device, and software/kernel identity. `.lock` files are internal to the writer; do not install them.
 
-The official filename does not distinguish output dtype, TP, model or vLLM version. Use separate `--save-path` directories for different software/kernel identities or output dtypes; merge only runs targeting the same runtime/layout. Matching filenames alone cannot prove performance compatibility with a different vLLM kernel.
+- By default, rerunning a file with **new, disjoint** `M` values preserves its existing entries. Repeating an existing `M` fails rather than silently replacing a tuned result.
+- `--overwrite` replaces **only the requested** overlapping `M` values, retaining other entries.
+- Participating GPUs must be the same model. `M` values are assigned using deterministic load balancing; worker results are checked for missing, extra, or duplicate entries before the parent writes them.
+- Each file is written atomically under a filesystem lock. A run touching multiple shapes is **not** a transaction: if a later file fails, earlier completed files can remain, but the overall command exits unsuccessfully.
 
-## Install and verify on the target CUDA host
+**Separate incompatible tuning contexts.** vLLM's filename contains `(N, K)`, device name, FP8 type, and block shape, **not** the model, TP, output dtype, or vLLM/kernel version. Use distinct `--save-path` directories for different output dtypes, kernel builds, or other incompatible contexts. The tool does not automatically reject cross-run provenance mismatches that share a filename.
 
-Use the exact output directory from your command. Single-model wrappers default to the repository `tuned_configs/` directory. For Python's default, run these commands from the repository root:
+### Inspect, install, and verify safely
+
+Generated JSON is inert until placed in the installed vLLM configuration directory. **Use a disposable vLLM environment for validation**: installing a file changes which tuning config that environment's Triton wrapper may load. Do not overwrite an existing installation blindly.
+
+The following example installs **one file only if no file with that name already exists**:
 
 ```bash
 CONFIG_DIR=$(python3 -c 'from pathlib import Path; from vllm.model_executor.layers.quantization.utils import fp8_utils; print(Path(fp8_utils.__file__).resolve().parent / "configs")')
-cp ./tuned_configs/*.json "$CONFIG_DIR/"
+SOURCE=$(find ./tuned_configs/quickstart -maxdepth 1 -type f -name 'N=*.json' -print -quit)
 
-# New process: real installed loader, requested M coverage and public Triton wrapper
-python3 benchmark_w8a8_block_fp8.py --shape 128 256 --batch-size 17 --out-dtype float16 \
-  --save-path ./tuned_configs --verify-installed
+if [ -z "$SOURCE" ]; then
+  echo "No generated config found" >&2
+else
+  mkdir -p "$CONFIG_DIR"
+  TARGET="$CONFIG_DIR/$(basename "$SOURCE")"
+  if [ -e "$TARGET" ]; then
+    echo "Refusing to replace existing config: $TARGET" >&2
+    echo "Back it up and explicitly approve replacement first." >&2
+  else
+    cp "$SOURCE" "$TARGET"
+    echo "Installed: $TARGET"
+  fi
+fi
 ```
 
-Configs apply only when N, K, normalized device, `fp8_w8a8` and block shape match the actual loader, and serving chooses the regular-linear Triton backend. The loader chooses the closest saved M; reports record only the M actually measured. Restart serving processes after installation because the loader caches configs. Backend selection may choose another kernel (e.g. CUTLASS/DeepGEMM/FlashInfer); copying JSON alone does not prove it is used. Verify the selected backend and real model calls on your chosen vLLM build, then compare serving performance under identical conditions. This repository makes no current end-to-end serving performance claim.
+If a matching file **already exists**, make a backup and deliberately approve the replacement. The following commands are only for that case, after the variables above have been set:
 
-Source contracts were checked against vLLM main commit [`c741bfca70cfb777e2016f827eae31f6e215fe9f`](https://github.com/vllm-project/vllm/tree/c741bfca70cfb777e2016f827eae31f6e215fe9f) on 2026-10-08. This is a source compatibility reference, **not** a GPU-tested version guarantee. [Validation record](docs/VALIDATION.md) includes pinned kernel, adapter and loader sources and the remaining hardware gates.
+```bash
+BACKUP_DIR=$(mktemp -d "$PWD/tuned_configs/install-backup.XXXXXX")
+cp -p "$TARGET" "$BACKUP_DIR/"
+echo "Original saved in: $BACKUP_DIR"
+cp -i "$SOURCE" "$TARGET"   # Confirm interactively before replacing.
 
-Real CUDA acceptance is a **merge gate**, independent of CPU CI. The PR remains Draft until the hardware gate is satisfied. Exact preflight, small-shape tuning, installed-loader/public-wrapper checks, official model preview and 1-vs-10 call comparison commands are in [CUDA acceptance steps](docs/CUDA_VALIDATION.md).
+# After validation, restore the original file:
+cp -p "$BACKUP_DIR/$(basename "$TARGET")" "$TARGET"
+```
 
-## Tests and migration
+If the target file **did not exist before the test**, rollback means removing **only the file you installed** (`rm -- "$TARGET"`). Repeat this process per generated shape; never copy the entire output directory or `reports/` into vLLM. Restart affected serving processes after either installation or rollback. File installation may require write permission to your vLLM environment.
+
+In a **fresh Python process** after installation, verify the installed loader and public Triton wrapper with the **same shape, `M`, block layout, and output dtype** as your generated config:
+
+```bash
+python3 benchmark_w8a8_block_fp8.py \
+  --shape 128 256 \
+  --out-dtype bfloat16 \
+  --batch-size 17 \
+  --save-path ./tuned_configs/quickstart \
+  --verify-installed
+```
+
+This confirms loader contents and a numerical check of the public wrapper. It does **not** confirm that the full serving engine selects `TritonFp8BlockScaledMMKernel`: other backends such as CUTLASS, DeepGEMM, or FlashInfer may be selected instead. Verify the selected backend and actual model-serving behavior separately. The loader caches configurations, so restart serving processes after an intentional installation or rollback.
+
+For full, reproducible hardware acceptance—including both FP16 and BF16 smoke tests, the model preview, and single-call vs repeated-call comparisons—see [CUDA validation](docs/CUDA_VALIDATION.md).
+
+## Measurement methodology
+
+Each `(M, N, K)` is tuned against the **installed vLLM private Triton kernel**, not a copied kernel implementation. The tuner:
+
+1. Generates synthetic FP8 E4M3FN activations and weights with FP32 scales; all candidates for a shape use the same input tensors.
+2. Warms up each candidate and measures CUDA-event latency. The default is **one GEMM call per event**; explicit `--calls-per-event >1` reports a repeated-call average, a different workload that can change cache behavior and rankings.
+3. Shortlists the three fastest successful candidates, plus the default configuration if runnable, and remeasures them independently using medians.
+4. Compares finalists to an FP32 dequantized matmul computed from the **same FP8 tensors and scales** (`rtol=0.02`, `atol=0.02`, with non-finite outputs rejected).
+5. Saves the best passing finalist and a measurement report. Known Triton resource-exhaustion candidates are skipped; unexpected runtime/compilation errors abort rather than being hidden.
+
+This is a **kernel-level sanity and tuning check**, not proof of end-to-end accuracy, representative production input distributions, global optimality, or a serving throughput improvement. The selected kernel configuration matters only if the deployed vLLM build actually uses this Triton path.
+
+## Command reference
+
+| Option | Purpose |
+| --- | --- |
+| `--model MODEL` / `--shape N K` | Mutually exclusive shape sources; `--shape` can be repeated |
+| `--tp-size TP` | Target vLLM tensor-parallel size; default `1` |
+| `--out-dtype auto\|float16\|bfloat16\|float32\|half` | `auto` for model mode; explicit in shape mode; `half` aliases `float16` |
+| `--block-n N`, `--block-k K` | FP8 quantization block layout; defaults `128`, `128` |
+| `--batch-size M` | Tune one flattened GEMM `M`; otherwise use the default 18-point grid |
+| `--save-path DIR` | Write config JSON and reports under this directory; default `./tuned_configs` |
+| `--overwrite` | Allow replacing overlapping `M` entries only |
+| `--preview` | Print the task plan without running GPU kernels |
+| `--check-environment` | Validate CUDA/vLLM/Triton compatibility and device capability |
+| `--verify-installed` | Compare installed loader result with saved configs and test its public wrapper |
+| `--measurements N`, `--calls-per-event N` | CUDA-event measurement rounds (default `5`) and calls per event (default `1`) |
+| `--trust-remote-code` | Explicitly allow model repository code; **off by default** |
+
+The wrapper scripts also recognize `BATCH_SIZE`, `OUT_DTYPE`, `SAVE_PATH`, `PYTHON`, and `TRUST_REMOTE_CODE=1`. For batch examples, `SAVE_PATH` or `--save-path` specifies the **batch root**; each model/TP task is written to its own subdirectory. See [`examples/tune_qwen3_models.sh`](examples/tune_qwen3_models.sh).
+
+## Tests and troubleshooting
 
 ```bash
 python3 -m pytest -q
-# Optional real CUDA checks: compile/tune, 3 output dtypes, M=1/17/64, N tail, official loader/wrapper
+# On a compatible CUDA machine, also run:
 python3 -m pytest -q tests/test_gpu.py
 ```
 
-The optional GPU suite isolates the installed loader's config directory in a temporary location; it does not modify installed vLLM sources. Here it is **Not executed — CUDA GPU unavailable** (PyTorch/vLLM also absent). CPU unit/source-contract and Shell subprocess tests are recorded in [docs/VALIDATION.md](docs/VALIDATION.md); no GPU speedups are invented.
+The reviewed PR's Python 3.10/3.13 CPU/Shell checks passed, but the GPU module was skipped where CUDA/vLLM were unavailable. **A skipped GPU test is not a passed hardware test.** Detailed evidence is in [Validation notes](docs/VALIDATION.md).
 
-`benchmark_w8a8_block_fp8_qwencoder.py` is a deprecated thin wrapper requiring the same explicit source arguments. `scripts/tune_deepseek_v3.sh` now exits nonzero with a migration message: use observed `--shape N K --out-dtype float16` (or the actual target dtype). The old `...qwen3_30b.py` and `...qwen3omni_talker.py` actually run INT8 W8A8 despite their filenames; they remain marked legacy and do not redirect to FP8. [README_AWQ.md](README_AWQ.md) is historical: its custom JSON has no automatic vLLM AWQ consumer in the reviewed runtime.
+| Symptom | Check |
+| --- | --- |
+| `--shape` asks for `--out-dtype` | Set the output dtype used by the intended serving workload; it cannot be inferred from dimensions alone. |
+| Model architecture or exclusion rejected | The adapter cannot prove that a regular FP8 linear is present. Use a directly observed per-rank `--shape` only after checking the actual backend/layout. |
+| Existing `M` conflicts | Choose a new output directory, request disjoint `M` values, or use `--overwrite` deliberately. |
+| Kernel/helper/signature check fails | The installed vLLM version may be incompatible. Check the target build instead of silently falling back to another kernel. |
+| Generated JSON does not affect serving | Check the exact filename, `M` selection, installed directory, process restart, and whether serving actually selects the Triton backend. |
 
-## Repository layout
+## Project status and license
 
-```text
-benchmark_w8a8_block_fp8.py                # Maintained CUDA tuner/CLI
-fp8_tuning.py                             # CPU shape/merge/persistence helpers
-benchmark_w8a8_block_fp8_qwencoder.py       # Deprecated thin FP8 wrapper
-benchmark_w8a8_block_int8.py                # Legacy, unmaintained
-benchmark_awq_w4a16.py                     # Legacy, unmaintained
-benchmark_w8a8_block_fp8_qwen3_30b.py        # Historical INT8, misleading filename
-benchmark_w8a8_block_fp8_qwen3omni_talker.py # Historical INT8, misleading filename
-scripts/                                  # Shared maintained entry points/preflight; DeepSeek deprecation
-examples/tune_qwen3_models.sh              # Batch runner; any failure -> nonzero
-tests/                                   # CPU, Shell, source-contract and optional GPU tests
-docs/VALIDATION.md                        # Repair evidence and second review
-.github/workflows/tests.yml               # CPU/Shell CI
-README.md / README_zh.md / README_AWQ.md
-LICENSE / NOTICE
-```
+The actively maintained path is the CUDA W8A8 block-FP8 tuner. INT8/AWQ scripts and the old model-named entry points are retained as **legacy, experimental, and currently unmaintained**; their runtime compatibility and config consumption are not guaranteed. [`README_AWQ.md`](README_AWQ.md) is historical documentation, not an AWQ integration guide.
 
-Licensed under the complete Apache License 2.0 in [LICENSE](LICENSE); attribution is retained in [NOTICE](NOTICE) and SPDX headers.
+Source compatibility was reviewed against a fixed vLLM upstream revision, but this is **not** a guarantee for every vLLM release or a replacement for CUDA validation. See [Validation notes](docs/VALIDATION.md) for the exact revision and outstanding gates.
+
+Distributed under the [Apache License 2.0](LICENSE). Original code provenance and attribution are documented in [NOTICE](NOTICE) and source headers.
