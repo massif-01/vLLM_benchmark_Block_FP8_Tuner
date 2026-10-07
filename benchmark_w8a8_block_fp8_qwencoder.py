@@ -6,5 +6,5 @@ import sys
 from benchmark_w8a8_block_fp8 import cli
 
 if __name__ == '__main__':
-    print('Deprecated entry: use benchmark_w8a8_block_fp8.py with --model or --shape N K.', file=sys.stderr)
+    print('Deprecated entry: use benchmark_w8a8_block_fp8.py with --model or --shape N K with explicit --out-dtype.', file=sys.stderr)
     sys.exit(cli())

@@ -11,7 +11,10 @@ POSITIONALS=$(( $# < 4 ? $# : 4 ))
 shift "$POSITIONALS"
 SAVE_PATH=${SAVE_PATH:-"$PROJECT_DIR/tuned_configs"}
 ARGS=(--model "$MODEL" --tp-size "$TP" --block-n "$BLOCK_N" --block-k "$BLOCK_K"
-      --input-type "${INPUT_TYPE:-fp8}" --out-dtype "${OUT_DTYPE:-float16}" --save-path "$SAVE_PATH")
+      --input-type "${INPUT_TYPE:-fp8}" --save-path "$SAVE_PATH")
+if [[ -n "${OUT_DTYPE:-}" ]]; then
+    ARGS+=(--out-dtype "$OUT_DTYPE")
+fi
 case "${TRUST_REMOTE_CODE:-0}" in
     0) ;;
     1) ARGS+=(--trust-remote-code) ;;

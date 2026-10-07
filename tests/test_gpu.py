@@ -20,6 +20,7 @@ def test_cuda_tuning_and_runtime_loader(dtype,m,tmp_path,monkeypatch):
     bench.check_devices([0])
     args=bench.build_parser().parse_args(['--shape','129','256','--out-dtype',dtype,
                                          '--batch-size',str(m),'--measurements','3'])
+    bench.plan(args)
     candidates=[bench.default_config(128,128),dict(bench.default_config(128,128),BLOCK_SIZE_M=16)]
     cfg,report=bench.tune(m,129,256,args,candidates)
     assert report['winner']['correctness']['max_abs_error'] >= 0

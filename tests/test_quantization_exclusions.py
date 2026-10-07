@@ -23,7 +23,7 @@ def plan(config, monkeypatch):
         shapes, sources = core.model_shapes(config, tp_size)
         return config, shapes, sources
     monkeypatch.setattr(bench, 'load_model_shapes', loader)
-    return bench.plan(bench.build_parser().parse_args(['--model', 'official-style', '--tp-size', '4']))
+    return bench.plan(bench.build_parser().parse_args(['--model', 'official-style', '--tp-size', '4', '--out-dtype', 'float16']))
 
 
 def test_official_coder_style_allows_auto_planning(monkeypatch):

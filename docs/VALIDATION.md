@@ -43,7 +43,7 @@ GitHub API 查询当前 vLLM main 后，固定以下 commit 下载并检查相�
 
 | 检查 | 结果 |
 | --- | --- |
-| `python3 -m pytest -q` | **131 passed, 1 skipped**；约12秒。118项 CPU/unit/源码契约和13项 Shell/迁移子进程测试；GPU 模块因 PyTorch 缺失整组 skip |
+| `python3 -m pytest -q` | **160 passed, 1 skipped**；约16秒。138项 CPU/unit/源码契约和22项 Shell/迁移子进程测试；GPU 模块因 PyTorch 缺失整组 skip |
 | CPU shape/layout | TP1/2/4/8、head_dim 与 hidden 不同、KV replication、非法 TP/dimensions、fused gate/up、MoE dense/shared 存在性、routed 排除、未知/嵌套架构、配置加载失败、quant metadata/block/ignored layers |
 | CPU 调度/保存 | GPU>M、单 M、empty/duplicate 分配、完整/缺失 worker merge、单/多 worker exception、heterogeneous GPU 拒绝、shape 去重、成功完整保存+报告 |
 | CPU 数据安全 | disjoint merge、overlap 拒绝、显式覆盖保留其他 M、坏 JSON/重复 key 拒绝、dump/fsync/replace 故障不破坏原文件、8进程并发合并无丢失 |
@@ -107,6 +107,46 @@ CPU 实测没有被包装成 GPU 或性能验收。没有生成、提供或宣�
 目标 GPU 上的 preflight、smoke、installed-loader/public-wrapper、官方 model preview、1/10 calls 对照的准确命令见 [CUDA_VALIDATION.md](CUDA_VALIDATION.md)。本机 actual vLLM CLI model preview 因 vLLM/PyTorch 未安装而未执行；单-call vs repeated-call GPU 的 winner/ranking/median 对照也未执行。
 
 **Ready for independent re-review**：三项范围内代码修复和 CPU/Shell 回归已完成，硬件 gate 仍明确未通过；此结论不等于 ready for merge。
+
+## 第二次独立 Review：model-aware output dtype（本次，pre-GPU）
+
+本次只修 dtype 语义及必要的 CLI/worker/测试/文档联动，澄清 planner `*` convention；未重写上一轮 exclusions/LPT，未修改 parent aggregation、官方 JSON schema、filename 或 persistence。
+
+源码重新核对 vLLM main `32fbfa15e8bacc64182cb1286831bd63d7e4fc12`：
+
+- [`vllm/config/model.py`](https://github.com/vllm-project/vllm/blob/32fbfa15e8bacc64182cb1286831bd63d7e4fc12/vllm/config/model.py)：ModelConfig 调用 `_get_and_verify_dtype(model_id, config, dtype, *, is_pooling_model, revision=None, config_format="hf")`；auto 使用配置转换、平台 dtype policy 和 validity checks。
+- [`model_arch_config_convertor.py`](https://github.com/vllm-project/vllm/blob/32fbfa15e8bacc64182cb1286831bd63d7e4fc12/vllm/transformers_utils/model_arch_config_convertor.py)：config dtype/metadata conversion 属于 vLLM，不在 tuner 重写。
+- 常规 FP8 exclusion match mode 的 exact 语义与 planner 分类是不同的层；本工具对 scoped `*` 的分类只是 planner 安全分析，不声明 runtime glob 支持。
+
+`resolve_model_out_dtype()` 为薄调用：校验所核对的 API bind，传入 model/config 和 auto，映射返回的 torch float16/bfloat16/float32 为规范字符串；API、返回类型或 resolver 错误均明确失败并提示显式 dtype，不 fallback。没有 ModelConfig/engine/权重实例化或 CUDA 初始化调用。`tests/fixtures/vllm_dtype_contract.py` 保留固定源码的 resolver 和转换 getter 供 CPU 契约测试，注入 fake torch/config/platform，**不是**生产 fallback 或实际安装环境/GPU 验证。
+
+| 输入 | requested | resolved / source |
+| --- | --- | --- |
+| 官方 Qwen3-Coder BF16 fixture | auto | bfloat16 / vllm-model-auto |
+| 同一 fixture 显式 override | float16 | float16 / explicit |
+| BF16 dense Qwen3 | auto | bfloat16 / vllm-model-auto |
+| FP16 Qwen3 | auto | float16 / vllm-model-auto |
+| FP32 Qwen3（当前 CUDA SM80+ dtype policy） | auto | bfloat16 / vllm-model-auto，由 upstream resolver 选择平台首选 dtype；另测FP16-first policy返回float16 |
+| 显式 shape | auto | 拒绝，提示 --out-dtype |
+| 显式 shape | bfloat16 | bfloat16 / explicit |
+| half override | half | float16 / explicit |
+
+Parser 默认 auto，wrapper 未设置 OUT_DTYPE 时不传 dtype，不在模型 wrapper 硬编码 BF16。Args 保留原始 `out_dtype`，新增 `resolved_out_dtype`；plan/report 同时有 requested/resolved/canonical/source。tune 的 benchmark/reference/correctness 仅使用 resolved，verify 使用 plan 的 resolved，不重新读取 auto parser default。
+
+验收：先新增 dtype 回归并确认旧 plan 缺 requested/source、shape 默认猜 FP16，再修复。完整本地 **160 passed, 1 skipped**，compileall、6个 Shell 语法和 diff 检查通过；其中138项 CPU/unit/source-contract、22项 Shell/迁移子进程测试。原 shape-workload 测试明确传 dtype，原 exclusions/LPT/merge/persistence 回归保留；新增9项 wrapper dtype forwarding 和17项 dtype语义/3项 worker-report、tune/reference/correctness、verify 的 CPU flow 回归。
+
+独立实际 CLI 验证（本机没有 PyTorch/vLLM，无 CUDA）：
+
+```text
+--shape 128 256 --preview -> exit 1，明确提示 --out-dtype
+--shape 128 256 --out-dtype bfloat16 --preview -> exit 0，requested/resolved=bfloat16，source=explicit
+```
+
+Actual model preview 因 vLLM config loading 不可用而未执行；官方 fixture 的全 plan/source-contract 回归不能冒充 actual preview。本轮按指令 **CUDA / installed loader / serving — Not executed**，GPU acceptance deliberately deferred。GPU 文档保留显式 FP16 smoke、追加 BF16 smoke，官方 model preview 同时检查 shape 与 BF16/source，另有显式 FP16 override preview。
+
+第二轮自审确认：auto 调用 installed resolver；official/dense BF16、FP16、explicit cast、half 和失败路径均覆盖；shape 不猜 dtype；wrapper 不注入FP16；requested/resolved/source 未丢失；worker/correctness/verify canonical dtype 一致；英中 README 与 CUDA验收条件一致；planner wildcard 注释不冒充 runtime semantics；gate/gate_proj/bias/routed边界、LPT、parent merge、persistence 的功能未改；未执行本轮禁止的 GPU 验收。
+
+**Ready for independent pre-GPU re-review**。PR 继续 Draft；不是 ready to merge。Python3.10/3.13 对本次 head 的最新 CI 状态以 PR Checks 为准。
 
 ## 剩余风险与下一阶段条件
 

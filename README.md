@@ -17,7 +17,7 @@ A **CUDA-only vLLM W8A8 Block FP8 Triton kernel tuning tool**. The maintained en
 
 Auto shape detection is architecture-aware and only enabled for explicitly supported architectures. Unsupported architectures fail instead of falling back to unrelated shapes. Names containing “Qwen” are not used to select an adapter. MoE model support does not mean routed expert kernel tuning.
 
-Shape adapters establish the dimensions of regular linears; they do not prove that every layer is quantized or that a serving engine selects this Triton backend. If checkpoint quantization metadata exists, auto-detection accepts only dynamic `fp8` with matching `weight_block_size`. Both `ignored_layers` and `modules_to_not_convert` are checked together. Explicit non-target exclusions (LM head, embeddings, layernorms, Q/K norms, MoE router `mlp.gate`, shared-expert gate, routed-expert subtree and bias parameters) are allowed. Target projections in checkpoint or fused runtime names, broad parent scopes and unrecognized patterns fail closed with the offending exclusion and `--shape N K` guidance. The small classifier recognizes literal/scoped `*` components; it does not implement arbitrary regex patterns. Without metadata, the preview/report states that FP8 and backend selection still need runtime confirmation. Other quantization formats can use explicitly observed shapes only when they really reach the same kernel/layout.
+Shape adapters establish the dimensions of regular linears; they do not prove that every layer is quantized or that a serving engine selects this Triton backend. If checkpoint quantization metadata exists, auto-detection accepts only dynamic `fp8` with matching `weight_block_size`. Both `ignored_layers` and `modules_to_not_convert` are checked together. Explicit non-target exclusions (LM head, embeddings, layernorms, Q/K norms, MoE router `mlp.gate`, shared-expert gate, routed-expert subtree and bias parameters) are allowed. Target projections in checkpoint or fused runtime names, broad parent scopes and unrecognized patterns fail closed with the offending exclusion and `--shape N K` guidance. The planner can conservatively classify simple `*` component patterns when inspecting metadata. This is this tool's safety-analysis convention, not a claim that installed vLLM interprets those strings as globs; its regular FP8 path uses exact matching. The classifier does not implement a runtime glob/regex engine. Without metadata, the preview/report states that FP8 and backend selection still need runtime confirmation. Other quantization formats can use explicitly observed shapes only when they really reach the same kernel/layout.
 
 Repository still contains historical/experimental INT8 and AWQ scripts, but they are **not part of the currently maintained and validated workflow**. They are not recommended entry points; their compatibility, correctness and runtime consumption are not maintained. No ROCm/XPU support is provided.
 
@@ -30,7 +30,7 @@ Use a CUDA environment compatible with your installed vLLM. CPU planning/tests u
 python3 benchmark_w8a8_block_fp8.py --help
 
 # Explicit observed per-rank (N,K): CPU-only preview
-python3 benchmark_w8a8_block_fp8.py --shape 768 2048 --batch-size 17 --preview
+python3 benchmark_w8a8_block_fp8.py --shape 768 2048 --batch-size 17 --out-dtype float16 --preview
 
 # Architecture preview needs vLLM model-config loading, but does not initialize CUDA
 python3 benchmark_w8a8_block_fp8.py --model Qwen/Qwen3-8B --tp-size 4 --preview
@@ -39,7 +39,7 @@ python3 benchmark_w8a8_block_fp8.py --model Qwen/Qwen3-8B --tp-size 4 --preview
 bash scripts/environment_check.sh
 
 # Small actual tuning, including default comparison, finalist remeasurement and correctness
-python3 benchmark_w8a8_block_fp8.py --shape 128 256 --batch-size 17 --save-path ./tuned_configs
+python3 benchmark_w8a8_block_fp8.py --shape 128 256 --batch-size 17 --out-dtype float16 --save-path ./tuned_configs
 
 # Ordinary linear shapes in a Qwen3 model; confirm actual FP8 backend/checkpoint first
 bash scripts/tune_qwen3.sh Qwen/Qwen3-8B 4 128 128
@@ -56,12 +56,12 @@ The synthetic microbenchmark directly generates quantized FP8 A/B and scales. It
 | `--tp-size`, `-tp` | Target vLLM tensor-parallel world size, default `1`; not tuning GPU count |
 | `--batch-size` | Single GEMM M (flattened token rows); omitted: `1,2,4,8,16,24,32,48,64,96,128,256,512,1024,1536,2048,3072,4096` |
 | `--block-n`, `--block-k` | Checkpoint/runtime quantization layout, default `128,128`; powers of two >=32, not arbitrary tuning tiles |
-| `--out-dtype` | `float16` (default), `half` alias, `bfloat16`, `float32`; must match target runtime |
+| `--out-dtype` | `auto` (default, model only), `float16`, `half` alias, `bfloat16`, `float32`; explicit values must match serving startup options |
 | `--input-type` | Only `fp8` |
 | `--save-path` | Default `./tuned_configs` relative to current directory; single-model wrappers default to repository `tuned_configs/` |
 | `--overwrite` | Explicitly replace overlapping M values; other existing M values remain |
 | `--trust-remote-code` | Default off; explicitly authorizes executing code from the model repository |
-| `--preview` | Print shapes, layer sources, M, TP, layout and output dtype without CUDA |
+| `--preview` | Print shapes, layer sources, M, TP, layout and requested/resolved/source dtype without CUDA execution |
 | `--check-environment` | Check CUDA dependencies/devices and the actual required FP8 symbols/helper/signature |
 | `--verify-installed` | Check saved vs installed loader results and run its public Triton wrapper; does not verify serving backend selection |
 | `--seed` | Nonnegative synthetic-input seed, default `0` |
@@ -72,7 +72,9 @@ M is the GEMM M dimension, not necessarily the number of concurrent serving requ
 
 QKV uses `local_q = Q_heads / TP`, `local_kv = max(1, KV_heads / TP)`, `N = (local_q + 2*local_kv)*head_dim`, `K = hidden_size`. Attention output has `K = local_q*head_dim`, which need not equal `hidden_size/TP`. Exact Q/KV partition/replication relations are checked. A regular fused gate/up uses `N = 2*intermediate_size/TP`; it is generated only when the architecture actually constructs that MLP. Routed-expert dimensions are never inferred from `moe_intermediate_size`. Runtime K grouping and fused partition block alignment are also checked. Automatic adapters currently require square FP8 blocks: the source-audited `Fp8Config` activation grouping uses block N while the target GEMM expects block K. Non-square layouts require explicitly observed `--shape` inputs and confirmation that the real caller supplies the correct scales.
 
-Wrappers accept `MODEL TP BLOCK_N BLOCK_K` followed by extra CLI flags. `PYTHON`, `SAVE_PATH`, `OUT_DTYPE`, `INPUT_TYPE`, `BATCH_SIZE` and explicit `TRUST_REMOTE_CODE=1` are supported environment overrides. All wrappers leave remote code off by default. To preview through a wrapper:
+Model auto output dtype delegates to the installed vLLM `_get_and_verify_dtype` resolver with `dtype="auto"`, including its HF config conversion, downcasting and validity rules. Qwen3 BF16 checkpoints resolve to BF16. Explicit output dtype overrides are respected; `half` resolves to `float16`. Unsupported resolver APIs/results fail with `--out-dtype` guidance, without FP16 fallback. No engine or weights are loaded by this helper. Auto API source contract was checked at vLLM `32fbfa15e8bacc64182cb1286831bd63d7e4fc12`; this is not an installed-runtime test. `--shape` has no model dtype information and **requires explicit `--out-dtype`**, including for previews. Plan/report retain `requested_out_dtype`, `resolved_out_dtype`, canonical `out_dtype` and `out_dtype_source` (`vllm-model-auto` or `explicit`); execution uses only the resolved value.
+
+Wrappers accept `MODEL TP BLOCK_N BLOCK_K` followed by extra CLI flags. `PYTHON`, `SAVE_PATH`, `OUT_DTYPE`, `INPUT_TYPE`, `BATCH_SIZE` and explicit `TRUST_REMOTE_CODE=1` are supported environment overrides. Wrappers pass `--out-dtype` only when `OUT_DTYPE` is explicitly set, so model auto remains the default. All wrappers leave remote code off by default. To preview through a wrapper:
 
 ```bash
 bash scripts/tune_custom.sh Qwen/Qwen3-8B 4 128 128 --preview
@@ -105,7 +107,7 @@ CONFIG_DIR=$(python3 -c 'from pathlib import Path; from vllm.model_executor.laye
 cp ./tuned_configs/*.json "$CONFIG_DIR/"
 
 # New process: real installed loader, requested M coverage and public Triton wrapper
-python3 benchmark_w8a8_block_fp8.py --shape 128 256 --batch-size 17 \
+python3 benchmark_w8a8_block_fp8.py --shape 128 256 --batch-size 17 --out-dtype float16 \
   --save-path ./tuned_configs --verify-installed
 ```
 
@@ -125,7 +127,7 @@ python3 -m pytest -q tests/test_gpu.py
 
 The optional GPU suite isolates the installed loader's config directory in a temporary location; it does not modify installed vLLM sources. Here it is **Not executed — CUDA GPU unavailable** (PyTorch/vLLM also absent). CPU unit/source-contract and Shell subprocess tests are recorded in [docs/VALIDATION.md](docs/VALIDATION.md); no GPU speedups are invented.
 
-`benchmark_w8a8_block_fp8_qwencoder.py` is a deprecated thin wrapper requiring the same explicit source arguments. `scripts/tune_deepseek_v3.sh` now exits nonzero with a migration message: use observed `--shape N K`. The old `...qwen3_30b.py` and `...qwen3omni_talker.py` actually run INT8 W8A8 despite their filenames; they remain marked legacy and do not redirect to FP8. [README_AWQ.md](README_AWQ.md) is historical: its custom JSON has no automatic vLLM AWQ consumer in the reviewed runtime.
+`benchmark_w8a8_block_fp8_qwencoder.py` is a deprecated thin wrapper requiring the same explicit source arguments. `scripts/tune_deepseek_v3.sh` now exits nonzero with a migration message: use observed `--shape N K --out-dtype float16` (or the actual target dtype). The old `...qwen3_30b.py` and `...qwen3omni_talker.py` actually run INT8 W8A8 despite their filenames; they remain marked legacy and do not redirect to FP8. [README_AWQ.md](README_AWQ.md) is historical: its custom JSON has no automatic vLLM AWQ consumer in the reviewed runtime.
 
 ## Repository layout
 

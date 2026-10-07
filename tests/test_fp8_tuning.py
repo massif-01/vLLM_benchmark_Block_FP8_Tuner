@@ -150,7 +150,7 @@ def test_help_and_explicit_preview_without_gpu():
     result=subprocess.run([sys.executable,str(ROOT/'benchmark_w8a8_block_fp8.py'),'--help'],capture_output=True,text=True)
     assert result.returncode == 0, result.stderr
     result=subprocess.run([sys.executable,str(ROOT/'benchmark_w8a8_block_fp8.py'),
-                           '--shape','128','256','--shape','128','256','--batch-size','3','--preview'],capture_output=True,text=True)
+                           '--shape','128','256','--shape','128','256','--batch-size','3','--out-dtype','float16','--preview'],capture_output=True,text=True)
     assert result.returncode == 0, result.stderr
     preview=json.loads(result.stdout)
     assert preview['shapes'] == [[128,256]] and preview['M'] == [3]

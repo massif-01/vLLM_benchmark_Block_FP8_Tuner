@@ -112,11 +112,34 @@ def load_model_shapes(model, tp_size, trust_remote_code=False, loader=None):
     return config, shapes, sources
 
 
+def resolve_model_out_dtype(config, model):
+    """Delegate model auto dtype to installed vLLM; no engine or CUDA setup."""
+    try:
+        import inspect
+        import torch
+        from vllm.config.model import _get_and_verify_dtype
+
+        kwargs = dict(model_id=model, config=config, dtype='auto', is_pooling_model=False)
+        # Validate the reviewed API contract rather than guessing an older signature.
+        inspect.signature(_get_and_verify_dtype).bind(**kwargs)
+        dtype = _get_and_verify_dtype(**kwargs)
+        canonical = {torch.float16: 'float16', torch.bfloat16: 'bfloat16',
+                     torch.float32: 'float32'}.get(dtype)
+        if canonical is None:
+            raise ValueError(f'Unsupported resolved output dtype: {dtype!r}')
+        return canonical
+    except Exception as exc:
+        raise RuntimeError('Installed vLLM dtype resolver is incompatible or failed. '
+                           'Specify --out-dtype explicitly or use a supported vLLM version. '
+                           f'Details: {exc}') from exc
+
+
 def validate_quantization_exclusions(quant):
     """Allow only exclusions proven outside our regular-linear targets.
 
-    Recognize literal module components and scoped '*' components, not arbitrary
-    regex/glob expressions. Unknown or broad patterns remain fail closed.
+    Planner-side conservative classification of literal/scoped '*' components
+    only; this does not describe vLLM runtime glob semantics. Unknown or broad
+    patterns remain fail closed.
     """
     exclusions = []
     for name in ('ignored_layers', 'modules_to_not_convert'):

@@ -34,13 +34,13 @@ def test_source_audited_device_name_and_loader(tmp_path):
             assert official.get_w8a8_block_fp8_configs(256,256,128,128) is None
 
 
-@pytest.mark.parametrize('flags', [[],['--shape','0','128'],['--shape','128','256','--tp-size','0'],
- ['--shape','128','256','--block-k','48'],['--shape','128','96'],
- ['--shape','128','256','--batch-size','0'],['--shape','128','256','--measurements','0'],
- ['--shape','128','256','--calls-per-event','0'],['--shape','128','256','--input-type','int8'],
- ['--shape','128','256','--seed','-1'],['--preview','--check-environment']])
+@pytest.mark.parametrize('flags', [[],['--shape','0','128'],['--shape','128','256','--out-dtype','float16','--tp-size','0'],
+ ['--shape','128','256','--out-dtype','float16','--block-k','48'],['--shape','128','96'],
+ ['--shape','128','256','--out-dtype','float16','--batch-size','0'],['--shape','128','256','--out-dtype','float16','--measurements','0'],
+ ['--shape','128','256','--out-dtype','float16','--calls-per-event','0'],['--shape','128','256','--out-dtype','float16','--input-type','int8'],
+ ['--shape','128','256','--out-dtype','float16','--seed','-1'],['--preview','--check-environment']])
 def test_cli_errors(flags):
-    p=subprocess.run([sys.executable,str(ROOT/'benchmark_w8a8_block_fp8.py'),*flags,'--preview'],capture_output=True,text=True)
+    p=subprocess.run([sys.executable,str(ROOT/'benchmark_w8a8_block_fp8.py'),'--out-dtype','float16',*flags,'--preview'],capture_output=True,text=True)
     assert p.returncode != 0
     assert 'completed' not in p.stdout.lower()
 
@@ -113,6 +113,7 @@ exit "${STUB_STATUS:-0}"
     stub.chmod(0o755)
     env=dict(os.environ,PYTHON=str(stub),CAPTURE=str(tmp_path/'args'),STUB_STATUS='7',TRUST_REMOTE_CODE='0')
     env.pop('BATCH_SIZE',None)
+    env.pop('OUT_DTYPE',None)
     return env
 
 
@@ -121,7 +122,8 @@ exit "${STUB_STATUS:-0}"
 def test_shell_failure_propagation(wrapper,args,fake_python):
     p=subprocess.run(['bash',str(ROOT/'scripts'/wrapper),*args],env=fake_python,capture_output=True,text=True)
     assert p.returncode==7 and 'completed' not in p.stdout.lower()
-    assert '--trust-remote-code' not in Path(fake_python['CAPTURE']).read_text()
+    captured=Path(fake_python['CAPTURE']).read_text()
+    assert '--trust-remote-code' not in captured and '--out-dtype' not in captured
 
 
 def test_shell_explicit_trust_and_success(fake_python):
@@ -158,13 +160,13 @@ def test_deprecated_entries():
     p=subprocess.run(['bash',str(ROOT/'scripts/tune_deepseek_v3.sh')],capture_output=True,text=True)
     assert p.returncode==2 and 'Deprecated' in p.stderr
     p=subprocess.run([sys.executable,str(ROOT/'benchmark_w8a8_block_fp8_qwencoder.py'),
-                      '--shape','128','256','--preview'],capture_output=True,text=True)
+                      '--shape','128','256','--out-dtype','float16','--preview'],capture_output=True,text=True)
     assert p.returncode==0 and 'Deprecated' in p.stderr
     assert json.loads(p.stdout)['shapes']==[[128,256]]
 
 
 def test_main_worker_failure_never_saves(monkeypatch,tmp_path,capsys):
-    args=bench.build_parser().parse_args(['--shape','128','256','--batch-size','1','--save-path',str(tmp_path)])
+    args=bench.build_parser().parse_args(['--shape','128','256','--out-dtype','float16','--batch-size','1','--save-path',str(tmp_path)])
     cuda=SimpleNamespace(device_count=lambda:1,get_device_name=lambda i:'H100',set_device=lambda i:None)
     monkeypatch.setattr(bench,'load_runtime',lambda:{})
     monkeypatch.setattr(bench,'torch',SimpleNamespace(cuda=cuda))
@@ -177,7 +179,7 @@ def test_main_worker_failure_never_saves(monkeypatch,tmp_path,capsys):
 
 
 def test_main_heterogeneous_gpus_rejected(monkeypatch):
-    args=bench.build_parser().parse_args(['--shape','128','256'])
+    args=bench.build_parser().parse_args(['--shape','128','256','--out-dtype','float16'])
     monkeypatch.setattr(bench,'load_runtime',lambda:{})
     monkeypatch.setattr(bench,'check_devices',lambda ids:None)
     monkeypatch.setattr(bench,'torch',SimpleNamespace(cuda=SimpleNamespace(device_count=lambda:2,get_device_name=lambda i:f'GPU{i}')))
@@ -214,7 +216,7 @@ def test_default_and_runtime_identity_contract(monkeypatch):
 
 
 def test_main_saves_every_m_and_report(monkeypatch,tmp_path,capsys):
-    args=bench.build_parser().parse_args(['--shape','128','256','--batch-size','17','--save-path',str(tmp_path)])
+    args=bench.build_parser().parse_args(['--shape','128','256','--out-dtype','float16','--batch-size','17','--save-path',str(tmp_path)])
     monkeypatch.setattr(bench,'load_runtime',lambda:{'vllm':'mock'})
     monkeypatch.setattr(bench,'torch',SimpleNamespace(cuda=SimpleNamespace(device_count=lambda:8,
         get_device_name=lambda i:'H100',set_device=lambda i:None)))
@@ -246,7 +248,7 @@ save_configs(sys.argv[1],{int(sys.argv[2]):config},128)
 
 
 def test_multiworker_exception_propagates(monkeypatch,tmp_path,capsys):
-    args=bench.build_parser().parse_args(['--shape','128','256','--save-path',str(tmp_path)])
+    args=bench.build_parser().parse_args(['--shape','128','256','--out-dtype','float16','--save-path',str(tmp_path)])
     monkeypatch.setattr(bench,'load_runtime',lambda:{})
     monkeypatch.setattr(bench,'check_devices',lambda ids:None)
     monkeypatch.setattr(bench,'config_filename',lambda *a:'config.json')
@@ -306,7 +308,7 @@ sys.argv = ['benchmark'] + sys.argv[2:]
 sys.exit(bench.cli())
 ''')
     driver.chmod(0o755)
-    env = dict(os.environ, PYTHON=str(driver), BATCH_SIZE='1', TRUST_REMOTE_CODE='0')
+    env = dict(os.environ, PYTHON=str(driver), BATCH_SIZE='1', TRUST_REMOTE_CODE='0', OUT_DTYPE='float16')
     env.pop('SAVE_PATH', None)
     extra = []
     root = project/'tuned_configs'/'batch'
@@ -340,6 +342,21 @@ sys.exit(bench.cli())
 
 def test_single_call_is_default_benchmark_semantics():
     import inspect
-    args = bench.build_parser().parse_args(['--shape','128','256'])
+    args = bench.build_parser().parse_args(['--shape','128','256','--out-dtype','float16'])
     assert args.calls_per_event == 1
     assert inspect.signature(bench.benchmark_config).parameters['calls_per_event'].default == 1
+
+
+@pytest.mark.parametrize('wrapper,positionals', [('tune_custom.sh',['model']),
+    ('tune_qwen3.sh',[]),('tune_qwen3_coder.sh',[])])
+@pytest.mark.parametrize('dtype',[None,'float16','bfloat16'])
+def test_wrapper_only_forwards_explicit_dtype(wrapper,positionals,dtype,fake_python):
+    env=dict(fake_python,STUB_STATUS='0')
+    if dtype is not None: env['OUT_DTYPE']=dtype
+    result=subprocess.run(['bash',str(ROOT/'scripts'/wrapper),*positionals],env=env,capture_output=True,text=True)
+    assert result.returncode==0,result.stderr
+    args=Path(env['CAPTURE']).read_text().splitlines()
+    if dtype is None:
+        assert '--out-dtype' not in args
+    else:
+        assert args[args.index('--out-dtype')+1]==dtype

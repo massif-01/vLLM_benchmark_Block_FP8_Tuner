@@ -17,7 +17,7 @@
 
 自动 shape detection 只针对显式支持的 architecture。未知架构明确失败，不回退到无关尺寸；不以模型名包含 “Qwen” 判断 adapter。支持 MoE 模型的部分普通 linear **不等于调优 routed expert kernel**。
 
-Adapter 确认的是普通 linear 的维度，不证明每层都量化，也不证明 serving 引擎选用了本 Triton backend。有 checkpoint 量化元数据时，自动推导仅接受 dynamic `fp8`，且 `weight_block_size` 必须匹配。同时检查 `ignored_layers` 和 `modules_to_not_convert`。明确非目标 exclusion（LM head、embedding、layernorm、Q/K norm、MoE router `mlp.gate`、shared-expert gate、routed-expert 子树和 bias 参数）允许；checkpoint/fused runtime 名称中的目标 projection、宽泛父级范围及无法识别的 pattern 仍 fail closed，错误会指出具体 exclusion 和 `--shape N K` 路径。小分类器只识别字面名称/分段 `*`，不实现任意正则 pattern。无量化元数据时，预览/报告会明确提示仍需确认实际 FP8 和 backend。其他量化格式只有在真实到达相同 kernel/layout 时，才可用显式观测 shape。
+Adapter 确认的是普通 linear 的维度，不证明每层都量化，也不证明 serving 引擎选用了本 Triton backend。有 checkpoint 量化元数据时，自动推导仅接受 dynamic `fp8`，且 `weight_block_size` 必须匹配。同时检查 `ignored_layers` 和 `modules_to_not_convert`。明确非目标 exclusion（LM head、embedding、layernorm、Q/K norm、MoE router `mlp.gate`、shared-expert gate、routed-expert 子树和 bias 参数）允许；checkpoint/fused runtime 名称中的目标 projection、宽泛父级范围及无法识别的 pattern 仍 fail closed，错误会指出具体 exclusion 和 `--shape N K` 路径。Planner 可对简单分段 `*` pattern 做保守安全分类；这是本工具分析 metadata 的约定，不代表已安装 vLLM 把字符串当成 glob，常规 FP8 路径采用 exact matching。分类器不实现 runtime glob/regex engine。无量化元数据时，预览/报告会明确提示仍需确认实际 FP8 和 backend。其他量化格式只有在真实到达相同 kernel/layout 时，才可用显式观测 shape。
 
 仓库保留历史/实验性 INT8 和 AWQ 脚本，但它们**不属于当前维护和验证的工作流**，不推荐作为入口；不维护其兼容性、正确性和 runtime 配置消费能力。本项目不提供 ROCm/XPU 支持。
 
@@ -30,7 +30,7 @@ Adapter 确认的是普通 linear 的维度，不证明每层都量化，也不�
 python3 benchmark_w8a8_block_fp8.py --help
 
 # 已观测的每个 TP rank (N,K)：仅 CPU 预览
-python3 benchmark_w8a8_block_fp8.py --shape 768 2048 --batch-size 17 --preview
+python3 benchmark_w8a8_block_fp8.py --shape 768 2048 --batch-size 17 --out-dtype float16 --preview
 
 # 架构预览需要 vLLM 配置加载能力，但不初始化 CUDA
 python3 benchmark_w8a8_block_fp8.py --model Qwen/Qwen3-8B --tp-size 4 --preview
@@ -39,7 +39,7 @@ python3 benchmark_w8a8_block_fp8.py --model Qwen/Qwen3-8B --tp-size 4 --preview
 bash scripts/environment_check.sh
 
 # 小规模真实调优：包含默认配置对照、finalist 复测和 correctness
-python3 benchmark_w8a8_block_fp8.py --shape 128 256 --batch-size 17 --save-path ./tuned_configs
+python3 benchmark_w8a8_block_fp8.py --shape 128 256 --batch-size 17 --out-dtype float16 --save-path ./tuned_configs
 
 # Qwen3 的普通 linear；先确认真实 FP8 checkpoint/backend
 bash scripts/tune_qwen3.sh Qwen/Qwen3-8B 4 128 128
@@ -56,12 +56,12 @@ bash scripts/tune_qwen3.sh Qwen/Qwen3-8B 4 128 128
 | `--tp-size`, `-tp` | 目标 vLLM tensor-parallel world size，默认 `1`；不是调优 GPU 数量 |
 | `--batch-size` | 单个 GEMM M / flattened token rows；省略则为 `1,2,4,8,16,24,32,48,64,96,128,256,512,1024,1536,2048,3072,4096` |
 | `--block-n`, `--block-k` | checkpoint/runtime 的量化布局，默认 `128,128`；不小于 32 的 2 的幂，不是任意调优 tile |
-| `--out-dtype` | 默认 `float16`，`half` 为别名，另有 `bfloat16`、`float32`；须匹配目标 runtime |
+| `--out-dtype` | 默认 `auto`（仅 model 模式），另有 `float16`、`half` 别名、`bfloat16`、`float32`；显式值须匹配 serving 启动参数 |
 | `--input-type` | 只允许 `fp8` |
 | `--save-path` | 默认当前目录下 `./tuned_configs`；单模型 Shell wrapper 默认仓库根目录 `tuned_configs/` |
 | `--overwrite` | 显式替换重叠 M；保留其他已有 M |
 | `--trust-remote-code` | 默认关闭；显式授权执行模型仓库代码 |
-| `--preview` | 输出 shape、来源层、M、TP、布局和输出 dtype，不加载 CUDA |
+| `--preview` | 输出 shape、来源层、M、TP、布局及 requested/resolved/source dtype，不执行 CUDA |
 | `--check-environment` | 检查 CUDA 依赖/设备及实际需要的 FP8 symbol/helper/signature |
 | `--verify-installed` | 比较保存文件与已安装 loader 结果并运行其公开 Triton wrapper；不验证 serving backend 选择 |
 | `--seed` | 非负合成输入种子，默认 `0` |
@@ -72,7 +72,9 @@ M 是 GEMM 的 M 维度，不一定等于并发 serving request 数。TP 改变�
 
 QKV 使用 `local_q = Q_heads / TP`、`local_kv = max(1, KV_heads / TP)`，`N = (local_q + 2*local_kv)*head_dim`、`K = hidden_size`。Attention output 的 `K = local_q*head_dim`，不必等于 `hidden_size/TP`。严格验证 Q/KV 分片或复制关系。普通融合 gate/up 使用 `N = 2*intermediate_size/TP`，仅在对应架构实际构造该 MLP 时生成。不会从 `moe_intermediate_size` 推测 routed expert 尺寸。也会检查 runtime K 分组和 fused partition block 对齐。自动 adapter 当前要求方形 FP8 block：核对的 `Fp8Config` 用 block N 生成激活分组，而目标 GEMM 预期 block K。非方形布局必须使用显式观测的 `--shape`，并确认真实调用方提供正确 scales。
 
-Wrapper 接受 `MODEL TP BLOCK_N BLOCK_K`，四个位置参数后可跟额外 CLI flag。支持环境变量 `PYTHON`、`SAVE_PATH`、`OUT_DTYPE`、`INPUT_TYPE`、`BATCH_SIZE` 和显式 `TRUST_REMOTE_CODE=1`。所有 wrapper 默认关闭 remote code。例如预览：
+Model auto output dtype 调用已安装 vLLM 的 `_get_and_verify_dtype`，传入 `dtype="auto"`，复用其 HF config conversion、下转和有效性规则。Qwen3 BF16 checkpoint 解析为 BF16；显式 override 被尊重，`half` 规范化为 `float16`。Resolver API/结果不支持时明确失败并提示 `--out-dtype`，不回退 FP16；helper 不建立 engine、不加载权重。Auto API 源码契约核对于 vLLM `32fbfa15e8bacc64182cb1286831bd63d7e4fc12`，并非已安装 runtime 验收。`--shape` 没有模型 dtype 信息，**必须显式指定 `--out-dtype`**，预览也一样。Plan/report 同时记录 `requested_out_dtype`、`resolved_out_dtype`、规范化的 `out_dtype` 和 `out_dtype_source`（`vllm-model-auto` 或 `explicit`），执行只使用 resolved 值。
+
+Wrapper 接受 `MODEL TP BLOCK_N BLOCK_K`，四个位置参数后可跟额外 CLI flag。支持环境变量 `PYTHON`、`SAVE_PATH`、`OUT_DTYPE`、`INPUT_TYPE`、`BATCH_SIZE` 和显式 `TRUST_REMOTE_CODE=1`。只有显式设置 `OUT_DTYPE` 才传 `--out-dtype`，否则保留 model auto；所有 wrapper 默认关闭 remote code。例如预览：
 
 ```bash
 bash scripts/tune_custom.sh Qwen/Qwen3-8B 4 128 128 --preview
@@ -105,7 +107,7 @@ CONFIG_DIR=$(python3 -c 'from pathlib import Path; from vllm.model_executor.laye
 cp ./tuned_configs/*.json "$CONFIG_DIR/"
 
 # 新进程：真实已安装 loader、请求 M 覆盖以及公开 Triton wrapper
-python3 benchmark_w8a8_block_fp8.py --shape 128 256 --batch-size 17 \
+python3 benchmark_w8a8_block_fp8.py --shape 128 256 --batch-size 17 --out-dtype float16 \
   --save-path ./tuned_configs --verify-installed
 ```
 
@@ -125,7 +127,7 @@ python3 -m pytest -q tests/test_gpu.py
 
 可选 GPU 套件在临时目录隔离已安装 loader 的配置路径，不修改已安装 vLLM 源码。本机为 **Not executed — CUDA GPU unavailable**（同时未安装 PyTorch/vLLM）。CPU unit/源码契约及 Shell 子进程结果见 [docs/VALIDATION.md](docs/VALIDATION.md)，不编造 GPU 提速数据。
 
-`benchmark_w8a8_block_fp8_qwencoder.py` 改为 deprecated 薄 wrapper，要求与主入口相同的显式来源参数。`scripts/tune_deepseek_v3.sh` 现在非零退出并提示改用观测的 `--shape N K`。旧 `...qwen3_30b.py` 和 `...qwen3omni_talker.py` 实际运行 INT8 W8A8，与文件名不符；保留历史标记，不重定向成 FP8。[README_AWQ.md](README_AWQ.md) 是历史文档，其自定义 JSON 在核对的 vLLM AWQ runtime 中没有自动消费者。
+`benchmark_w8a8_block_fp8_qwencoder.py` 改为 deprecated 薄 wrapper，要求与主入口相同的显式来源参数。`scripts/tune_deepseek_v3.sh` 现在非零退出并提示改用观测的 `--shape N K --out-dtype float16`（或实际目标 dtype）。旧 `...qwen3_30b.py` 和 `...qwen3omni_talker.py` 实际运行 INT8 W8A8，与文件名不符；保留历史标记，不重定向成 FP8。[README_AWQ.md](README_AWQ.md) 是历史文档，其自定义 JSON 在核对的 vLLM AWQ runtime 中没有自动消费者。
 
 ## 仓库结构
 

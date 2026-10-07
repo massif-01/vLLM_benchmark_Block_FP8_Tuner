@@ -31,7 +31,8 @@ def tuning_runtime(monkeypatch):
     monkeypatch.setattr(bench, 'triton', triton)
     monkeypatch.setattr(bench, 'reference_matmul', lambda *a: Tensor())
     args = bench.build_parser().parse_args(['--shape', '256', '256', '--batch-size', '1',
-                                          '--block-n', '256', '--block-k', '256'])
+                                          '--block-n', '256', '--block-k', '256', '--out-dtype', 'float16'])
+    bench.plan(args)
     baseline = bench.default_config(256, 256)
     candidate = dict(baseline, BLOCK_SIZE_M=16, BLOCK_SIZE_N=32, BLOCK_SIZE_K=32)
     return args, baseline, candidate

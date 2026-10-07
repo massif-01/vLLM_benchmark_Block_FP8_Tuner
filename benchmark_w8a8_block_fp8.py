@@ -18,7 +18,8 @@ from typing import Any
 from fp8_tuning import (DEFAULT_BATCH_SIZES, atomic_json, config_filename,
                         distribute_batch_sizes, load_model_shapes, merge_results,
                         positive, read_configs, save_configs, timing_stats,
-                        unique_shapes, validate_launch, validate_model_quantization)
+                        unique_shapes, validate_launch, validate_model_quantization,
+                        resolve_model_out_dtype)
 
 # GPU dependencies are loaded only for tuning/checking. Spawn workers load their own runtime.
 torch = triton = current_platform = _w8a8_triton_block_scaled_mm = None
@@ -203,7 +204,7 @@ def tune(M, N, K, args, search_space):
     B = ((torch.rand(N,K,device='cuda')-0.5)*896).to(torch.float8_e4m3fn)
     As = (torch.rand(M,triton.cdiv(K,args.block_k),device='cuda')+0.1)*0.01
     Bs = (torch.rand(triton.cdiv(N,args.block_n),triton.cdiv(K,args.block_k),device='cuda')+0.1)*0.01
-    out_dtype = getattr(torch, args.out_dtype)
+    out_dtype = getattr(torch, args.resolved_out_dtype)
     block_size = [args.block_n,args.block_k]
     baseline = default_config(*block_size)
     candidates = [baseline] + [c for c in search_space if c != baseline]
@@ -267,7 +268,8 @@ def build_parser():
                         help='Observed per-TP-rank regular-linear shape; repeatable')
     parser.add_argument('--tp-size','-tp',type=int,default=1,help='Target vLLM TP world size, independent of tuning GPUs')
     parser.add_argument('--input-type',choices=['fp8'],default='fp8')
-    parser.add_argument('--out-dtype',choices=['float32','float16','half','bfloat16'],default='float16')
+    parser.add_argument('--out-dtype',choices=['auto','float32','float16','half','bfloat16'],default='auto',
+                        help='Model auto uses installed vLLM runtime dtype; --shape requires an explicit dtype')
     parser.add_argument('--block-n',type=int,default=128)
     parser.add_argument('--block-k',type=int,default=128)
     parser.add_argument('--batch-size',type=int,help='Single GEMM M / flattened token rows')
@@ -293,21 +295,28 @@ def plan(args):
         value = getattr(args,name)
         if value < 32 or value & (value-1):
             raise ValueError(f'{name} must be a power of two >=32')
-    if args.out_dtype == 'half':
-        args.out_dtype = 'float16'
+    requested_dtype = args.out_dtype
     sizes = DEFAULT_BATCH_SIZES if args.batch_size is None else [positive(args.batch_size,'batch_size')]
     if args.model:
         config, shapes, sources = load_model_shapes(args.model,args.tp_size,args.trust_remote_code)
         note = validate_model_quantization(config,args.block_n,args.block_k)
     elif args.shape:
+        if requested_dtype == 'auto':
+            raise ValueError('--shape does not provide model dtype information. '
+                             'Specify --out-dtype float16, bfloat16, or float32 explicitly.')
         shapes = unique_shapes(args.shape)
         sources = [{'shape':list(s),'layer':'user-observed per-rank regular linear'} for s in shapes]
         note = 'Explicit per-rank shapes are not divided by TP; user must confirm actual FP8/backend/layout.'
     else:
         raise ValueError('Specify --model or --shape N K; no default/fallback architecture')
     validate_plan_layout(shapes,sources,args,config if args.model else None)
+    resolved_dtype = (resolve_model_out_dtype(config,args.model) if requested_dtype == 'auto'
+                      else 'float16' if requested_dtype == 'half' else requested_dtype)
+    args.resolved_out_dtype = resolved_dtype
     return {'shapes':shapes,'M':sizes,'sources':sources,'note':note,'tp_size':args.tp_size,
-            'block_shape':[args.block_n,args.block_k],'out_dtype':args.out_dtype}
+            'block_shape':[args.block_n,args.block_k], 'requested_out_dtype':requested_dtype,
+            'resolved_out_dtype':resolved_dtype,'out_dtype':resolved_dtype,
+            'out_dtype_source':'vllm-model-auto' if requested_dtype == 'auto' else 'explicit'}
 
 
 def validate_plan_layout(shapes, sources, args, config=None):
@@ -351,7 +360,7 @@ def verify_installed(args, tasks):
             B = ((torch.rand(N,K,device='cuda')-.5)*896).to(torch.float8_e4m3fn)
             As = (torch.rand(M,triton.cdiv(K,args.block_k),device='cuda')+.1)*.01
             Bs = (torch.rand(triton.cdiv(N,args.block_n),triton.cdiv(K,args.block_k),device='cuda')+.1)*.01
-            dtype = getattr(torch,args.out_dtype)
+            dtype = getattr(torch,tasks['resolved_out_dtype'])
             reference = reference_matmul(A,B,As,Bs,[args.block_n,args.block_k],dtype)
             actual = w8a8_triton_block_scaled_mm(A,B,As,Bs,[args.block_n,args.block_k],dtype)
             if not torch.isfinite(actual).all() or not torch.isfinite(reference).all():

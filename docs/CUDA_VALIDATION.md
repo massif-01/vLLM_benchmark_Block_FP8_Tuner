@@ -1,6 +1,8 @@
 # CUDA acceptance gate for PR #3 / CUDA 验收步骤
 
-**Current local status / 本地状态: Not executed — CUDA GPU unavailable.**
+**Current round: Not executed — GPU acceptance deliberately deferred.**
+
+No CUDA benchmark, installed-loader or serving acceptance is executed in this round. The commands below remain a later hardware gate; current local hardware is also unavailable.
 
 CPU/unit, Shell and source-config fixture results do not satisfy this gate. PR #3 stays Draft; these commands are for the target NVIDIA CUDA host. Run from the repository root in the CUDA PyTorch/vLLM environment. No model weights are needed for the explicit-shape smoke.
 
@@ -22,6 +24,19 @@ python3 benchmark_w8a8_block_fp8.py \
 ```
 
 This must actually complete compilation/search, finalist correctness, winner selection, official JSON and report saving. This shape fits the default 128x128 layout; it is not a full model sweep. A fresh directory is assumed. Reruns with the same M require explicit `--overwrite`.
+
+### Additional BF16 smoke / 追加 BF16 验收
+
+Explicit shape cannot use auto dtype. In the later GPU stage, also execute BF16 once in a separate directory:
+
+```bash
+python3 benchmark_w8a8_block_fp8.py \
+  --shape 128 256 --batch-size 17 --out-dtype bfloat16 \
+  --seed 0 --measurements 3 --calls-per-event 1 \
+  --save-path ./tuned_configs/smoke/bf16
+```
+
+Require compilation/search, finalist correctness, winner, JSON and report success for BF16 as well. This command is documented only, not executed now.
 
 ## 3. Installed loader / public wrapper
 
@@ -48,7 +63,19 @@ python3 benchmark_w8a8_block_fp8.py \
   --tp-size 4 --preview
 ```
 
-For the reviewed official config, expected regular-linear shapes are `(1280,2048)` and `(2048,1024)`. Its 145 LM-head/layernorm/router exclusions must not cause rejection. Routed expert, router and shared-gate tuning remain excluded. Record the actual config revision/path and result; a CPU fixture test is not this CLI integration check.
+For the reviewed official config, expected regular-linear shapes are `(1280,2048)` and `(2048,1024)`. Its 145 LM-head/layernorm/router exclusions must not cause rejection. Also require `requested_out_dtype="auto"`, `resolved_out_dtype="bfloat16"`, canonical `out_dtype="bfloat16"` and `out_dtype_source="vllm-model-auto"`. Shapes alone are not sufficient. Routed expert, router and shared-gate tuning remain excluded. Record the actual config revision/path and result; a CPU fixture test is not this CLI integration check.
+
+### Explicit override preview / 显式 override 预览
+
+This is also a config-only check, not a CUDA benchmark. With vLLM config loading available:
+
+```bash
+python3 benchmark_w8a8_block_fp8.py \
+  --model "${MODEL_CONFIG:-Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8}" \
+  --tp-size 4 --out-dtype float16 --preview
+```
+
+Require `requested_out_dtype="float16"`, `resolved_out_dtype="float16"`, `out_dtype="float16"`, `out_dtype_source="explicit"`; the BF16 checkpoint must not override the user's FP16 request.
 
 ## 5. Single-call vs repeated-call comparison / 1 与 10 calls 对照
 
