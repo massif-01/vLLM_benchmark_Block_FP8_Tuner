@@ -42,7 +42,7 @@ Observed per-rank (N, K) ──────────────────�
 | NVIDIA CUDA GPUs with compute capability **8.9 or newer** | Earlier GPUs, ROCm, XPU, or CPU tuning |
 | Installed vLLM W8A8 block-FP8 **Triton regular-linear** kernel | Routed/fused MoE expert kernel tuning |
 | Explicit Qwen3 dense and Qwen3-MoE *regular-linear* shape adapters | Generic architecture guessing; Qwen3-Next/VL/Omni and DeepSeek automatic planning |
-| FP8 E4M3FN inputs and FP32 scales; FP16, BF16, or FP32 outputs | INT8 and AWQ development (historical scripts remain unmaintained) |
+| FP8 E4M3FN inputs and FP32 scales; FP16, BF16, or FP32 outputs | INT8 and AWQ tuning (legacy implementations removed) |
 
 **Important:** A Qwen3-MoE adapter does **not** tune routed experts. Nor does finding a linear shape prove that the running model uses block-FP8 or selects the Triton backend. Runtime backend selection must be verified separately.
 
@@ -254,7 +254,9 @@ The reviewed PR's Python 3.10/3.13 CPU/Shell checks passed, but the GPU module w
 
 ## Project status and license
 
-The actively maintained path is the CUDA W8A8 block-FP8 tuner. INT8/AWQ scripts and the old model-named entry points are retained as **legacy, experimental, and currently unmaintained**; their runtime compatibility and config consumption are not guaranteed. [`README_AWQ.md`](README_AWQ.md) is historical documentation, not an AWQ integration guide.
+The actively maintained path is the CUDA W8A8 block-FP8 tuner. This repository no longer provides the legacy INT8/AWQ tuning implementations or their four Python entry points. External calls or imports using those removed entries will stop working. Their [historical source and AWQ documentation](https://github.com/massif-01/vLLM_benchmark_Block_FP8_Tuner/tree/392a13ad7e8b1e34b3e9e44576c957e841174697) remain available at the fixed commit before removal.
+
+The FP8 compatibility entry [`benchmark_w8a8_block_fp8_qwencoder.py`](benchmark_w8a8_block_fp8_qwencoder.py) and DeepSeek migration-hint script [`scripts/tune_deepseek_v3.sh`](scripts/tune_deepseek_v3.sh) remain. The latter provides migration guidance, not DeepSeek automatic shape planning.
 
 Source compatibility was reviewed against a fixed vLLM upstream revision, but this is **not** a guarantee for every vLLM release or a replacement for CUDA validation. See [Validation notes](docs/VALIDATION.md) for the exact revision and outstanding gates.
 

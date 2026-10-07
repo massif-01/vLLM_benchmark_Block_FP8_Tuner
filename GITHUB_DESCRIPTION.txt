@@ -1,1 +1,1 @@
-CUDA-only vLLM W8A8 Block FP8 Triton kernel tuner with strict Qwen3 regular-linear shape planning, complete multi-GPU merging and numerical validation. INT8/AWQ are legacy and not maintained.
+CUDA-only vLLM W8A8 Block FP8 Triton kernel tuner with strict Qwen3 regular-linear shape planning, complete multi-GPU merging and numerical validation. Legacy INT8/AWQ tuning implementations are not included.

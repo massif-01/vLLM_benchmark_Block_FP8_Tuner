@@ -156,3 +156,54 @@ Actual model preview 因 vLLM config loading 不可用而未执行；官方 fixt
 4. 写入按文件原子；文件系统需支持 advisory lock/atomic replace。报告或后续 shape 保存失败可能留下此前已完成配置，流程返回失败且不声称整体成功。
 
 **Not ready for upstream PR investigation**：代码修复、CPU/Shell 回归和第二轮自查已完成，但缺真实 CUDA kernel/loader/serving 证据，尚不能声称目标 GPU 路径完成验收。没有创建 upstream PR。
+
+
+## 独立 INT8/AWQ Cleanup 记录（2026-10-08）
+
+本次为普通模式下的独立 cleanup，不重写以上历史审查记录。执行前已核对仓库身份、默认分支 `master`、PR #3 已合并且没有已有 cleanup PR；实际删除前基线 `BASE_SHA` 为 [`392a13ad7e8b1e34b3e9e44576c957e841174697`](https://github.com/massif-01/vLLM_benchmark_Block_FP8_Tuner/tree/392a13ad7e8b1e34b3e9e44576c957e841174697)，与用户提供的复核基线一致。使用独立分支和干净 worktree，原工作区未改；不修改或重开 PR #3。
+
+精确删除五个文件，dry-run 与实际删除清单一致；删除前各文件 blob SHA 均与交接材料一致：
+
+- `benchmark_w8a8_block_int8.py`
+- `benchmark_awq_w4a16.py`
+- `benchmark_w8a8_block_fp8_qwen3_30b.py`
+- `benchmark_w8a8_block_fp8_qwen3omni_talker.py`
+- `README_AWQ.md`
+
+两个误名 FP8 的 Qwen3 文件实际导入旧 INT8 内核。删除前按五个完整文件名和四个 Python 模块名搜索所有跟踪内容，并检查 import、动态 import、Shell/subprocess、CI 和测试调用；匹配仅为待删文件自身示例和两份 README 历史说明，无正式 FP8 或保留测试依赖。未建立 archive、stub、替代 wrapper 或量化后端。
+
+README 中只局部更新旧实现保留状态、移除失效的当前链接，加入固定历史版本及兼容性说明；`GITHUB_DESCRIPTION.txt` 同步。四个旧 Python 入口/模块的外部调用会中断，本次不提供替代 INT8/AWQ 实现。真正的 FP8 兼容入口 `benchmark_w8a8_block_fp8_qwencoder.py` 和 DeepSeek 迁移提示脚本继续保留。
+
+CI 仅改两处命令：CPU pytest 明确排除 `tests/test_gpu.py`；Shell 语法检查逐文件执行，避免 `bash -n scripts/*.sh examples/*.sh` 只解析第一个脚本。Actions、Python matrix、依赖、权限及其余 workflow 内容不变。
+
+### 删除前后非 GPU 验收
+
+同一个隔离环境：Python 3.13.13 / pytest 9.1.1。两轮均从 worktree 根目录执行相同命令；没有修改用户已有的 PyTorch/vLLM 环境。
+
+| 检查 | 删除前 | 删除后 |
+| --- | --- | --- |
+| `python3 -m pytest --collect-only -q --ignore=tests/test_gpu.py` | 160 个非 GPU 节点 | 相同 160 个节点，集合完全一致 |
+| `python3 -m pytest -q --ignore=tests/test_gpu.py` | 160 passed in 16.79s | 160 passed in 15.90s |
+| 正式 FP8 入口、helper、兼容入口与 tests 的 compileall | 通过 | 通过 |
+| 六个 Shell 文件逐项 `bash -n` | 全部通过 | 全部通过 |
+| 正式 FP8 `--help` | exit 0 | exit 0 |
+| 两个入口的 `--shape 128 256 --out-dtype bfloat16 --preview` | 均 exit 0；计划相同，resolved BF16 | 同左 |
+| `--shape 128 256 --preview` | exit 1，要求显式 `--out-dtype` | 同左 |
+| 同一 BF16 shape 加 `--input-type int8` | exit 2，argparse 拒绝 INT8 | 同左 |
+
+节点清单按完整 node ID 排序、每行一个 ID、尾部换行后的 SHA256：`3ed401844db85805b00dbf1730cabb50010329eb8920936307d47e6918fdc0ad`。没有通过删测试、减少测试节点或改变负向断言获取通过。GPU suite 明确未收集、未执行；本轮非 GPU 结果没有 skipped，不使用旧的“160 passed, 1 skipped”成绩。
+
+逐文件 Shell 检查：
+
+| 文件 | 删除前 | 删除后 |
+| --- | --- | --- |
+| `scripts/environment_check.sh` | 通过 | 通过 |
+| `scripts/tune_custom.sh` | 通过 | 通过 |
+| `scripts/tune_qwen3.sh` | 通过 | 通过 |
+| `scripts/tune_qwen3_coder.sh` | 通过 | 通过 |
+| `scripts/tune_deepseek_v3.sh` | 通过 | 通过 |
+| `examples/tune_qwen3_models.sh` | 通过 | 通过 |
+
+受保护文件以 Git blob 和文件模式逐项对照 `BASE_SHA`；除五项删除及获准文档/CI 修改外，所有原有跟踪文件保持一致，全部 tests/fixtures 未改，`docs/CUDA_VALIDATION.md`、LICENSE、NOTICE、`.gitignore` 未改。暂存区、工作树和相对基线的 diff 分别检查；无新增、重命名、复制、类型或模式变化，无混入临时证据文件。
+
+**GPU tuning / GPU correctness / installed-loader / serving：本轮全部未执行。** 没有安装或覆盖任何 vLLM 配置，没有推送默认分支、自动合并或操作 vLLM 上游；本次 cleanup 不改变已有 GPU 验收结论。独立 PR 的 head 和最新 Python 3.10/3.13 CI 结果以该 PR 正文及 Checks 为准。

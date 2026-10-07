@@ -42,7 +42,7 @@
 | Compute Capability **8.9 及以上**的 NVIDIA CUDA GPU | 更早的 GPU；ROCm、XPU、CPU 调优 |
 | 已安装 vLLM 的 W8A8 Block FP8 **Triton 普通线性层**内核 | Routed/Fused MoE 专家内核调优 |
 | Qwen3 Dense 与 Qwen3-MoE 的明确普通线性层 Adapter | 通用架构猜测；Qwen3-Next/VL/Omni、DeepSeek 自动推导 |
-| FP8 E4M3FN 输入、FP32 Scale；FP16/BF16/FP32 输出 | INT8 与 AWQ 功能开发（历史脚本保留但不维护） |
+| FP8 E4M3FN 输入、FP32 Scale；FP16/BF16/FP32 输出 | INT8 与 AWQ 调优（旧实现已移除） |
 
 **特别说明：** 支持 Qwen3-MoE 的部分普通线性层，**不代表**支持 Routed Expert 调优。能够算出某个 Linear 的形状，也不能证明实际运行的模型采用 Block FP8、或最终选择了 Triton 后端。后两项必须单独核实。
 
@@ -257,7 +257,9 @@ python3 -m pytest -q tests/test_gpu.py
 
 ## 项目状态与许可
 
-目前正式维护的是 **CUDA W8A8 Block FP8** 主路径。INT8、AWQ 和旧的模型专用脚本只作为**历史/实验性、当前不维护**的代码保留，不保证其 Runtime 兼容性或配置能够被自动消费。[`README_AWQ.md`](README_AWQ.md) 是历史资料，不代表 AWQ 已完成集成。
+目前正式维护的是 **CUDA W8A8 Block FP8** 主路径。本仓库不再提供旧 INT8/AWQ 调优实现及其四个 Python 入口；外部对这些已移除入口或模块的调用将中断。[历史源码与 AWQ 文档](https://github.com/massif-01/vLLM_benchmark_Block_FP8_Tuner/tree/392a13ad7e8b1e34b3e9e44576c957e841174697)可通过删除前的固定 commit 追溯。
+
+真正的 FP8 兼容入口 [`benchmark_w8a8_block_fp8_qwencoder.py`](benchmark_w8a8_block_fp8_qwencoder.py)和 DeepSeek 迁移提示脚本 [`scripts/tune_deepseek_v3.sh`](scripts/tune_deepseek_v3.sh)继续保留。后者提供迁移指引，不提供 DeepSeek 自动形状推导。
 
 仓库曾针对一个固定的 vLLM 上游版本核对源码契约；这既不代表与所有版本兼容，也不能替代 CUDA 实测。固定版本和待验收事项参见 [验证记录](docs/VALIDATION.md)。
 
