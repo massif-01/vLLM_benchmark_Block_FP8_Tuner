@@ -12,6 +12,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install pytest
-      - run: python -m pytest -q
+      - run: python -m pytest -q --ignore=tests/test_gpu.py
       - run: python -m compileall -q benchmark_w8a8_block_fp8.py fp8_tuning.py benchmark_w8a8_block_fp8_qwencoder.py tests
-      - run: bash -n scripts/*.sh examples/*.sh
+      - run: |
+          for file in scripts/*.sh examples/*.sh; do
+            bash -n "$file" || exit 1
+          done
